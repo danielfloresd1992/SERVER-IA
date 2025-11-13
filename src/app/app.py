@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 
 app = FastAPI()
@@ -8,3 +8,15 @@ app = FastAPI()
 def init_sever():
     return { "status": "active" }
 
+
+
+@app.websocket('/ws')
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            pass
+    
+    
+    except WebSocketDisconnect:
+        print(f'cliente desconectado')
