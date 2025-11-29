@@ -85,6 +85,9 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 # Procesar la imagen
                 image_data = data.get('image', '')
+                roi = data.get('roi_coordinates', '')
+                print(roi)
+                ##
                 if image_data:
                     # Decodificar base64
                     if ',' in image_data:
@@ -96,7 +99,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     
                     if img is not None:
                         # Procesar frame
-                        processed_img, metadata = vehicle_processor.process_frame(img)
+                        processed_img, metadata = vehicle_processor.process_frame(img, roi)
                         
                         # Codificar resultado como JPG
                         success, encoded_image = cv2.imencode('.jpg', processed_img, 

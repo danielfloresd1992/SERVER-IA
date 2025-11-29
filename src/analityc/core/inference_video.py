@@ -16,6 +16,8 @@ from ..config.config import DEFAULT_ROI
 
 logger = logging.getLogger(__name__)
 
+
+
 class VehicleProcessor:
     """Procesador de vehículos desacoplado para uso en endpoints/sockets"""
     
@@ -544,7 +546,7 @@ class VehicleProcessor:
         
         return image
     
-    def process_frame(self, image: np.ndarray) -> Tuple[np.ndarray, Dict[str, Any]]:
+    def process_frame(self, image: np.ndarray,  roi) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Procesa un frame y retorna la imagen procesada + metadatos
         
@@ -557,6 +559,8 @@ class VehicleProcessor:
         if self.model is None:
             raise RuntimeError("Modelo YOLO no inicializado")
         
+        if not roi is None: self.roi_polygon = np.array(roi, np.int32)
+
         self.frame_counter += 1
         self.last_processed_frame = image.copy()  # Guardar para posibles fotos
         
