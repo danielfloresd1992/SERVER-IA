@@ -1,2 +1,6 @@
 venv/
 .env
+src/__pycache__/
+Car Exit/
+yolo11n.pt
+detection_log.txt

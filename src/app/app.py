@@ -147,8 +147,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info('Cliente WebSocket desconectado')
     except Exception as e:
         logger.error(f"Error general en WebSocket: {e}")
-    finally:
-        await websocket.close()
+    
 
 
 
