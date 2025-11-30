@@ -35,20 +35,27 @@ class Main_Window(QMainWindow):
         title_gpu = QLabel('Installed GPUs:')
         title_gpu.setStyleSheet("font-weight: bold; margin-top: 10px;")
         main_layout.addWidget(title_gpu)
-        
-        for index, device in enumerate(device_hardware.gpu_tuple):
-            gpus_label = QLabel(f'{device["gpu_use"]}, {device["gpu_name"]}')
-            data_gpu = device_hardware.get_gpu_info(index)
+
+        if len(device_hardware.gpu_tuple) > 0:
+            for index, device in enumerate(device_hardware.gpu_tuple):
+                gpus_label = QLabel(f'{device["gpu_use"]}, {device["gpu_name"]}')
+                data_gpu = device_hardware.get_gpu_info(index)
+                
+                tooltip = (
+                    f"<b>GPU {index} - {data_gpu['name']}</b><br>"
+                    f"Memory total: {data_gpu['memory_total_gb']:.1f} GB<br>"
+                    f"Compute capability: {data_gpu['compute_capability']}<br>"
+                    f"Multiprocessors: {data_gpu['multiprocessor_count']}"
+                )
+                
+                gpus_label.setToolTip(tooltip)
+                main_layout.addWidget(gpus_label)
+        else:
+            no_gpu_label = QLabel('No GPUs available (Not detected)')
+            main_layout.addWidget(no_gpu_label)
             
-            tooltip = (
-                f"<b>GPU {index} - {data_gpu['name']}</b><br>"
-                f"Memory total: {data_gpu['memory_total_gb']:.1f} GB<br>"
-                f"Compute capability: {data_gpu['compute_capability']}<br>"
-                f"Multiprocessors: {data_gpu['multiprocessor_count']}"
-            )
-            
-            gpus_label.setToolTip(tooltip)
-            main_layout.addWidget(gpus_label)
+            device_default = QLabel(f"Default Device: {device_hardware.device_default['gpu_use'] if device_hardware.cuda_available else 'cpu'}")
+            main_layout.addWidget(device_default)
 
         # Sección de botones
         buttons_layout = QHBoxLayout()

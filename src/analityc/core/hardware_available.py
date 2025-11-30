@@ -12,7 +12,7 @@ class Device_hardware:
     device_default = 'cpu'
     cuda_available = False
     gpu_available = False
-
+    gpu_tuple = []
 
     def __init__(self):
         self.cpu = cpuinfo.get_cpu_info()['brand_raw']
@@ -32,7 +32,7 @@ class Device_hardware:
                 self.gpu_available = True
                 self.device_default = self.gpu_tuple[0]
             else:
-                self.gpu_tuple = tuple()
+                self.gpu_tuple = []
                 self.gpu_available = False
 
 
