@@ -54,8 +54,8 @@ class Main_Window(QMainWindow):
             no_gpu_label = QLabel('No GPUs available (Not detected)')
             main_layout.addWidget(no_gpu_label)
             
-            device_default = QLabel(f"Default Device: {device_hardware.device_default['gpu_use'] if device_hardware.cuda_available else 'cpu'}")
-            main_layout.addWidget(device_default)
+        device_default = QLabel(f"Default Device: {device_hardware.device_default['gpu_use'] if device_hardware.cuda_available else 'cpu'}")
+        main_layout.addWidget(device_default)
 
         # Sección de botones
         buttons_layout = QHBoxLayout()
