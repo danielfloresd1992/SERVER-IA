@@ -1,1 +1,1 @@
-from .cuda_available import device_hardware
+from .cuda_available import device_hardwaregit

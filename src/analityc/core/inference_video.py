@@ -4,19 +4,16 @@ import torch
 from ultralytics import YOLO
 from collections import defaultdict, deque
 import logging
-from typing import Tuple, Dict, Any, Optional, List
+from typing import Tuple, Dict, Any, List
 import asyncio
 import threading
 import base64
 import httpx
-import json
 import datetime
 import os
 from ..config.config import DEFAULT_ROI
 
 logger = logging.getLogger(__name__)
-
-
 
 
 class VehicleProcessor:
@@ -30,18 +27,6 @@ class VehicleProcessor:
                  log_file: str = "output/detection_log.txt",
                  car_exit_dir: str = "output/Car_Exit",
                  image_quality: int = 60):
-        """
-        Inicializa el procesador de vehículos
-        
-        Args:
-            model_path: Ruta al modelo YOLO
-            confidence_threshold: Umbral de confianza para detecciones
-            iou_threshold: Umbral IoU para NMS
-            device: Dispositivo para inferencia ('auto', 'cpu', 'cuda:0')
-            log_file: Ruta al archivo de log de detecciones
-            car_exit_dir: Directorio para guardar fotos de autos lavados
-            image_quality: Calidad de la imagen para guardar (0-100)
-        """
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
         self.model_path = model_path
@@ -49,307 +34,259 @@ class VehicleProcessor:
         self.car_exit_dir = car_exit_dir
         self.image_quality = image_quality
         
-        # Configuración de tracking OPTIMIZADA
-        self.max_frame_gap = 5  # Reducido para limpieza más agresiva
-        self.min_consec_frames = 3  # Mínimo frames para considerar track válido
-        self.frames_outside_to_remove = 1  # Eliminación inmediata
-        self.min_time_inside = 3  # REDUCIDO: Mínimo tiempo dentro del ROI para contar como lavado
+        # Configuración de tracking - AJUSTADO PARA MEJOR DETECCIÓN DE SALIDA
+        self.max_frame_gap = 30
+        self.min_consec_frames = 2  # Reducido para mayor sensibilidad
+        self.min_time_inside = 3    # Reducido para mayor sensibilidad
         
         # Estado interno
         self.frame_counter = 0
         self.autos_lavados = 0
         self.active_tracks = {}
-        self.removed_tracks = set()
         self.next_id = 1
-        self.track_history = defaultdict(lambda: deque(maxlen=15))
-        self.counted_ids = set()
+        self.track_history = defaultdict(lambda: deque(maxlen=30))
         
-        # ROI por defecto (puede ser configurado)
+        # Contadores por tipo de vehículo
+        self.car_count = 0
+        self.truck_count = 0
+        self.motorcycle_count = 0
+        
+        # ROI por defecto
         self.roi_polygon = np.array(DEFAULT_ROI, np.int32)
         
-     
-        
-        # Configuración de compresión de imagen
         self.image_compression_level = 9
-        
-        # Buffer para logs
         self._log_buffer = []
         
-        # Inicializar modelo
+        # Estado para debug
+        self.last_counted_frame = 0
+        self.last_counted_id = 0
+        self.debug_mode = True
+        
         self.model = None
         self.device = self._setup_device(device)
         self._initialize_model()
         
-        # Crear directorios necesarios
         os.makedirs(self.car_exit_dir, exist_ok=True)
         self.setup_log_file()
     
-
-
     def _setup_device(self, device: str) -> str:
-        """Configura el dispositivo de inferencia y muestra mensaje"""
         if device == "auto":
             if torch.cuda.is_available():
-                cuda_device = "cuda:0"
-                logger.info("✅ CUDA funcionando - Usando GPU")
                 print("✅ CUDA funcionando - Usando GPU")
-                return cuda_device
+                return "cuda:0"
             else:
-                logger.info("⚠️ CUDA no disponible - Usando CPU")
                 print("⚠️ CUDA no disponible - Usando CPU")
                 return "cpu"
         else:
             if device.startswith("cuda") and not torch.cuda.is_available():
-                logger.warning(f"⚠️ {device} solicitado pero no disponible - Usando CPU")
                 print(f"⚠️ {device} solicitado pero no disponible - Usando CPU")
                 return "cpu"
             else:
-                if device.startswith("cuda"):
-                    logger.info(f"✅ CUDA funcionando - Usando {device}")
-                    print(f"✅ CUDA funcionando - Usando {device}")
-                else:
-                    logger.info(f"✅ Usando CPU")
-                    print(f"✅ Usando CPU")
+                print(f"✅ Usando {device}")
                 return device
 
-
-
     def _initialize_model(self):
-        """Inicializa el modelo YOLO con configuración optimizada"""
         try:
-            logger.info(f"Inicializando modelo YOLO en {self.device}")
             print(f"🚀 Inicializando modelo YOLO en {self.device}...")
-            
             self.model = YOLO(self.model_path).to(self.device)
-            
-            # Warmup del modelo con configuración optimizada
             dummy_input = np.zeros((320, 320, 3), dtype=np.uint8)
             _ = self.model.predict(
-                dummy_input, 
-                imgsz=320, 
-                device=self.device,
-                classes=[2, 7],  # car=2, truck=7
-                verbose=False
+                dummy_input, imgsz=320, device=self.device,
+                classes=[2, 3, 7], verbose=False
             )
-            
-            device_type = "GPU" if self.device.startswith("cuda") else "CPU"
-            logger.info(f"✅ Modelo YOLO inicializado correctamente en {device_type}")
-            print(f"✅ Modelo YOLO inicializado correctamente en {device_type}")
-            
+            print(f"✅ Modelo YOLO inicializado correctamente en {self.device}")
         except Exception as e:
-            logger.error(f"❌ Error inicializando YOLO: {e}")
             print(f"❌ Error inicializando YOLO: {e}")
             raise
-    
 
-
-    
-    
-
-    
     def setup_log_file(self):
-        """Configura el archivo de log"""
         with open(self.log_file, 'w', encoding="utf-8") as f:
-            f.write("Timestamp,Frame,Autos_Lavados\n")
-    
+            f.write("Timestamp,Frame,Total_Vehicles,Cars,Trucks,Motorcycles\n")
 
-
-
-    def log_detection(self, frame_count: int, autos_lavados: int, flush: bool = False):
-        """Registra una detección en el log"""
+    def log_detection(self, frame_count: int, flush: bool = False):
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._log_buffer.append(f"{ts},{frame_count},{autos_lavados}")
-        
+        log_entry = f"{ts},{frame_count},{self.autos_lavados},{self.car_count},{self.truck_count},{self.motorcycle_count}"
+        self._log_buffer.append(log_entry)
         if flush or len(self._log_buffer) >= 60:
             with open(self.log_file, 'a', encoding="utf-8") as f:
                 f.write("\n".join(self._log_buffer) + "\n")
             self._log_buffer.clear()
-    
-
 
     def calculate_iou(self, box1: Tuple, box2: Tuple) -> float:
-        """Calcula Intersection over Union entre dos bounding boxes"""
         x11, y11, x21, y21 = box1
         x1_2, y1_2, x2_2, y2_2 = box2
-        
         xi1 = max(x11, x1_2)
         yi1 = max(y11, y1_2)
         xi2 = min(x21, x2_2)
         yi2 = min(y21, y2_2)
         inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-        
         box1_area = (x21 - x11) * (y21 - y11)
         box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
-        
         union_area = box1_area + box2_area - inter_area
         return inter_area / union_area if union_area > 0 else 0
-    
-
 
     def center_of(self, box: Tuple) -> Tuple[float, float]:
-        """Calcula el centro de un bounding box"""
         x1, y1, x2, y2 = box
         return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
-    
-    
+
     def is_inside_polygon(self, point: Tuple, polygon: np.ndarray) -> bool:
-        """Verifica si un punto está dentro del polígono"""
         return cv2.pointPolygonTest(polygon, (int(point[0]), int(point[1])), False) >= 0
-    
 
-
-    def check_exit_direction(self, track_id: int) -> bool:
-        """Verifica la dirección de salida del vehículo - VERSIÓN SIMPLIFICADA"""
-        if track_id not in self.track_history or len(self.track_history[track_id]) < 2:
-            return True  # Si no hay historial suficiente, contar igual
-        
-        history = list(self.track_history[track_id])
-        # Tomar los últimos 3 puntos del historial
-        recent_points = history[-min(3, len(history)):]
-        
-        if len(recent_points) < 2:
-            return True
-        
-        # Calcular movimiento en Y (vertical)
-        first_y = recent_points[0][1]
-        last_y = recent_points[-1][1]
-        y_movement = last_y - first_y
-        
-        # Si se mueve hacia abajo (Y aumenta) o hay poco movimiento, contar
-        # Umbral más permisivo
-        return y_movement >= -10  # Permite movimiento hacia arriba hasta 10px
-    
-
-
-    def count_vehicle_exit(self, track_id: int, frame_idx: int):
-        """Función dedicada para contar la salida de vehículos"""
+    def count_vehicle_exit(self, track_id: int, frame_idx: int) -> bool:
+        """Cuenta un vehículo cuando sale del ROI - VERSIÓN MEJORADA"""
         if track_id not in self.active_tracks:
+            if self.debug_mode:
+                print(f"❌ Track {track_id} no encontrado para conteo")
             return False
         
         track = self.active_tracks[track_id]
         
-        # Verificar condiciones para contar
-        if (track.get('counted_exit', False) or 
-            track['class'] != 'car' or 
-            track['seen_frames'] < self.min_consec_frames):
+        if self.debug_mode:
+            print(f"\n🔍 ANALIZANDO CONTEO para Track {track_id}:")
+            print(f"   Clase: {track['class']}")
+            print(f"   Estado: {track.get('state', 'unknown')}")
+            print(f"   Ya contado?: {track.get('counted_exit', False)}")
+            print(f"   Frames vistos: {track['seen_frames']}")
+            print(f"   Frames dentro ROI: {track.get('frames_inside_roi', 0)}")
+            print(f"   Entry frame: {track.get('entry_frame', 'N/A')}")
+        
+        if track.get('counted_exit', False):
+            if self.debug_mode:
+                print(f"⚠️ Track {track_id} ya fue contado anteriormente")
             return False
         
-
-        # Verificar tiempo mínimo dentro del ROI
-        time_inside = frame_idx - track.get('first_inside_frame', frame_idx)
-        if time_inside < self.min_time_inside:
+        if track['class'] not in ['car', 'truck', 'motorcycle']:
+            if self.debug_mode:
+                print(f"⚠️ Track {track_id} no es vehículo válido: {track['class']}")
             return False
         
-
-        # Verificar dirección de salida
-        if not self.check_exit_direction(track_id):
+        # Reducir el mínimo de frames consecutivos requeridos para mayor sensibilidad
+        if track['seen_frames'] < 2:  # Reducido para mejor detección
+            if self.debug_mode:
+                print(f"⚠️ Track {track_id} no tiene frames suficientes: {track['seen_frames']} < 2")
             return False
         
-
-        # CONTAR EL VEHÍCULO
+        if 'entry_frame' not in track:
+            if self.debug_mode:
+                print(f"⚠️ Track {track_id} nunca entró al ROI (entry_frame no existe)")
+            return False
+        
+        frames_inside = track.get('frames_inside_roi', 0)
+        # Reducir el tiempo mínimo dentro del ROI para mayor sensibilidad
+        if frames_inside < 3:  # Reducido para mejor detección
+            if self.debug_mode:
+                print(f"⚠️ Track {track_id} no estuvo suficiente tiempo en ROI: {frames_inside} < 3")
+            return False
+        
         self.autos_lavados += 1
+        self.last_counted_frame = frame_idx
+        self.last_counted_id = track_id
+        
+        vehicle_type = track['class']
+        if vehicle_type == 'car':
+            self.car_count += 1
+            type_text = "CARRO"
+        elif vehicle_type == 'truck':
+            self.truck_count += 1
+            type_text = "CAMION"
+        elif vehicle_type == 'motorcycle':
+            self.motorcycle_count += 1
+            type_text = "MOTOCICLETA"
+        else:
+            type_text = "VEHÍCULO"
+        
         track['counted_exit'] = True
         track['exit_frame'] = frame_idx
         
-
-        logger.info(f"🎉 AUTO LAVADO CONTADO - Total: {self.autos_lavados} (ID: {track_id}, Tiempo dentro: {time_inside} frames)")
-        print(f"🎉 AUTO LAVADO CONTADO - Total: {self.autos_lavados} (ID: {track_id})")
+        print(f"\n{'='*60}")
+        print(f"🎉🎉🎉 {type_text} CONTADO EXITOSAMENTE!")
+        print(f"   ID: {track_id}")
+        print(f"   Tipo: {track['class']}")
+        print(f"   Frames dentro ROI: {frames_inside}")
+        print(f"   Frames totales: {track['seen_frames']}")
+        print(f"   Total vehículos: {self.autos_lavados}")
+        print(f"   Estadísticas: Carros={self.car_count}, Camiones={self.truck_count}, Motos={self.motorcycle_count}")
+        print(f"{'='*60}\n")
         
-        
-        # Guardar foto del auto lavado
         if hasattr(self, 'last_processed_frame'):
             self.save_exit_photo(self.last_processed_frame, track['class'], track_id)
         
         return True
-    
-    
-    
-    def match_detections_to_tracks(self, detections: list) -> tuple:
-        """Empareja detecciones con tracks existentes"""
-        matched_pairs = []
-        unmatched_detections = list(range(len(detections)))
-        unmatched_tracks = list(self.active_tracks.keys())
-        
-        if not detections or not self.active_tracks:
-            return matched_pairs, unmatched_detections, unmatched_tracks
-        
-        # Crear matriz de costos IoU
-        cost_matrix = []
-        for det_idx, det in enumerate(detections):
-            row = []
-            for track_id in unmatched_tracks:
-                track = self.active_tracks[track_id]
-                iou = self.calculate_iou(det['box'], track['box'])
-                row.append(iou)
-            cost_matrix.append(row)
-        
-        # Emparejamiento greedy
-        for det_idx in range(len(detections)):
-            best_iou = 0.4
-            best_track_idx = -1
-            
-            for track_idx, track_id in enumerate(unmatched_tracks):
-                if cost_matrix[det_idx][track_idx] > best_iou:
-                    best_iou = cost_matrix[det_idx][track_idx]
-                    best_track_idx = track_idx
-            
-            if best_track_idx != -1:
-                track_id = unmatched_tracks[best_track_idx]
-                matched_pairs.append((track_id, det_idx))
-                unmatched_tracks.pop(best_track_idx)
-                if det_idx in unmatched_detections:
-                    unmatched_detections.remove(det_idx)
-        
-        return matched_pairs, unmatched_detections, unmatched_tracks
-    
 
-
-
-    def cleanup_stale_tracks(self, frame_idx: int):
-        """Limpieza de tracks - CON CONTEO MEJORADO"""
-        tracks_to_remove = []
-        roi_polygon_points = self.roi_polygon.reshape((-1, 1, 2))
+    def cleanup_stale_tracks(self, frame_idx: int) -> int:
+        """Elimina tracks que no se han visto en varios frames - VERSIÓN MENOS AGRESIVA"""
+        to_remove = []
         
-        for track_id, track in list(self.active_tracks.items()):
-            current_pos = track['center']
-            is_inside = self.is_inside_polygon(current_pos, roi_polygon_points)
-            confirmed = track['seen_frames'] >= self.min_consec_frames
+        for track_id, track in self.active_tracks.items():
+            frames_since_last_seen = frame_idx - track['last_seen']
             
-            # PRIMERO: Contar si está saliendo y cumple condiciones
-            if not is_inside and confirmed and track.get('state') == 'inside':
-                self.count_vehicle_exit(track_id, frame_idx)
-            
-            # LUEGO: Verificar eliminación
-            if not is_inside and confirmed:
-                tracks_to_remove.append(track_id)
-                logger.info(f"🚨 ELIMINACIÓN - ID {track_id} fuera del ROI")
+            if track.get('counted_exit', False):
+                if frames_since_last_seen > 5:
+                    to_remove.append(track_id)
                 continue
             
-            # Eliminar por inactividad
-            gap = frame_idx - track['last_seen']
-            if gap > self.max_frame_gap:
-                tracks_to_remove.append(track_id)
-                logger.info(f"Eliminando ID {track_id} - No detectado por {gap} frames")
-                continue
+            # Solo eliminar tracks que nunca entraron al ROI y llevan mucho tiempo
+            if track.get('entry_frame') is None and frames_since_last_seen > self.max_frame_gap * 2:
+                to_remove.append(track_id)
+            # Eliminar tracks que llevan mucho tiempo sin verse
+            elif frames_since_last_seen > self.max_frame_gap * 3:
+                to_remove.append(track_id)
         
-        # Eliminar tracks
-        for track_id in tracks_to_remove:
+        for track_id in to_remove:
             if track_id in self.active_tracks:
                 del self.active_tracks[track_id]
-                if track_id in self.track_history:
-                    del self.track_history[track_id]
-                logger.info(f"✅ Track {track_id} eliminado")
+            if track_id in self.track_history:
+                del self.track_history[track_id]
+            if self.debug_mode:
+                print(f"🗑️ Track {track_id} eliminado por inactividad")
         
-        return len(tracks_to_remove)
+        return len(to_remove)
     
-
+    def match_detections_to_tracks(self, detections: List[Dict]) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+        """Empareja detecciones con tracks activos usando IOU"""
+        if not self.active_tracks or not detections:
+            return [], list(range(len(detections))), list(self.active_tracks.keys())
+        
+        similarity_matrix = np.zeros((len(self.active_tracks), len(detections)))
+        track_ids = list(self.active_tracks.keys())
+        
+        for i, track_id in enumerate(track_ids):
+            track_box = self.active_tracks[track_id]['box']
+            for j, det in enumerate(detections):
+                similarity_matrix[i, j] = self.calculate_iou(track_box, det['box'])
+        
+        matched_pairs = []
+        unmatched_detections = list(range(len(detections)))
+        unmatched_tracks = list(range(len(track_ids)))
+        
+        iou_threshold = 0.3
+        
+        while True:
+            if similarity_matrix.size == 0:
+                break
+                
+            max_iou = np.max(similarity_matrix)
+            if max_iou < iou_threshold:
+                break
+            
+            i, j = np.unravel_index(np.argmax(similarity_matrix), similarity_matrix.shape)
+            
+            matched_pairs.append((track_ids[i], j))
+            unmatched_tracks.remove(i)
+            unmatched_detections.remove(j)
+            
+            similarity_matrix[i, :] = 0
+            similarity_matrix[:, j] = 0
+        
+        unmatched_track_ids = [track_ids[i] for i in unmatched_tracks]
+        
+        return matched_pairs, unmatched_detections, unmatched_track_ids
     
     def update_tracks(self, detections: list, frame_idx: int):
         """Actualiza los tracks con nuevas detecciones"""
-        # Limpieza antes de procesar nuevas detecciones
         removed_count = self.cleanup_stale_tracks(frame_idx)
-        if removed_count > 0:
-            logger.info(f"🔧 Limpieza: {removed_count} tracks eliminados")
+        if removed_count > 0 and self.debug_mode:
+            print(f"🔧 Limpieza: {removed_count} tracks eliminados")
         
         current_detections = []
         for det in detections:
@@ -363,23 +300,19 @@ class VehicleProcessor:
         if self.active_tracks and current_detections:
             matched_pairs, unmatched_detections, unmatched_tracks = self.match_detections_to_tracks(current_detections)
             
-            # Actualizar tracks emparejados
             for track_id, det_idx in matched_pairs:
                 det = current_detections[det_idx]
                 self.active_tracks[track_id].update({
                     'box': det['box'],
                     'center': det['center'],
                     'last_seen': frame_idx,
-                    'seen_frames': self.active_tracks[track_id]['seen_frames'] + 1,
-                    'class': det['class']
+                    'seen_frames': self.active_tracks[track_id]['seen_frames'] + 1
                 })
                 self.track_history[track_id].append(det['center'])
             
-            # Tracks no emparejados
             for track_id in unmatched_tracks:
                 self.active_tracks[track_id]['last_seen'] = frame_idx
             
-            # Nuevos tracks para detecciones no emparejadas
             for det_idx in unmatched_detections:
                 det = current_detections[det_idx]
                 new_id = self.next_id
@@ -392,15 +325,16 @@ class VehicleProcessor:
                     'last_seen': frame_idx,
                     'seen_frames': 1,
                     'state': 'outside',
-                    'counted': False,
                     'counted_exit': False,
-                    'first_detected': frame_idx,
-                    'first_inside_frame': None
+                    'frames_inside_roi': 0,
+                    'consecutive_inside': 0,
+                    'consecutive_outside': 0,
+                    'entry_frame': None,
+                    'exit_frame': None
                 }
                 self.track_history[new_id].append(det['center'])
                 
         elif current_detections:
-            # Crear tracks para todas las detecciones
             for det in current_detections:
                 new_id = self.next_id
                 self.next_id += 1
@@ -412,49 +346,92 @@ class VehicleProcessor:
                     'last_seen': frame_idx,
                     'seen_frames': 1,
                     'state': 'outside',
-                    'counted': False,
                     'counted_exit': False,
-                    'first_detected': frame_idx,
-                    'first_inside_frame': None
+                    'frames_inside_roi': 0,
+                    'consecutive_inside': 0,
+                    'consecutive_outside': 0,
+                    'entry_frame': None,
+                    'exit_frame': None
                 }
                 self.track_history[new_id].append(det['center'])
         
         return self.active_tracks
-    
-
 
     def update_vehicle_state(self, frame_idx: int):
-        """Actualiza el estado de los vehículos - VERSIÓN MEJORADA"""
+        """Actualiza el estado de los vehículos - VERSIÓN CORREGIDA PARA MEJOR DETECCIÓN DE SALIDA"""
         roi_polygon_points = self.roi_polygon.reshape((-1, 1, 2))
         
+        exit_candidates = []
+        
         for tid, obj in list(self.active_tracks.items()):
-            current_pos = obj['center']
-            prev_state = obj.get('state', 'outside')
-            confirmed = (obj['seen_frames'] >= self.min_consec_frames)
-            
-            if not confirmed:
+            if obj.get('counted_exit', False):
                 continue
-                
+            
+            current_pos = obj['center']
             is_currently_inside = self.is_inside_polygon(current_pos, roi_polygon_points)
-            new_state = 'inside' if is_currently_inside else 'outside'
             
-            # Registrar cuando entra al ROI por primera vez
-            if new_state == 'inside' and obj.get('first_inside_frame') is None:
-                obj['first_inside_frame'] = frame_idx
-                logger.info(f"🚗 ID {tid} entró al ROI por primera vez en frame {frame_idx}")
+            # Guardar el estado anterior
+            prev_state = obj.get('state', 'outside')
             
-            # Actualizar estado
-            if prev_state != new_state:
-                logger.info(f"🚗 ID {tid} cambió de {prev_state} a {new_state} en frame {frame_idx}")
-                obj['state'] = new_state
+            # Actualizar contadores consecutivos
+            if is_currently_inside:
+                obj['consecutive_inside'] = obj.get('consecutive_inside', 0) + 1
+                obj['consecutive_outside'] = 0
+                
+                # Actualizar frames dentro ROI
+                obj['frames_inside_roi'] = obj.get('frames_inside_roi', 0) + 1
+                
+                # Determinar si acaba de entrar
+                if prev_state == 'outside' and obj['consecutive_inside'] >= 2:
+                    obj['state'] = 'inside'
+                    if obj.get('entry_frame') is None:
+                        obj['entry_frame'] = frame_idx
+                    if self.debug_mode:
+                        print(f"🚗 Track {tid} ({obj['class']}) ENTRÓ al ROI en frame {frame_idx}")
+                        print(f"   Centro: {current_pos}")
+                        print(f"   Consecutive inside: {obj['consecutive_inside']}")
+                elif prev_state == 'inside':
+                    obj['state'] = 'inside'
+            else:
+                obj['consecutive_outside'] = obj.get('consecutive_outside', 0) + 1
+                obj['consecutive_inside'] = 0
+                
+                # Determinar si acaba de salir
+                if prev_state == 'inside' and obj['consecutive_outside'] >= 2:  # Aumentado a 2 para mayor estabilidad
+                    obj['state'] = 'outside'
+                    # Verificar si debe ser contado
+                    frames_inside = obj.get('frames_inside_roi', 0)
+                    if frames_inside >= self.min_time_inside:
+                        exit_candidates.append(tid)
+                        if self.debug_mode:
+                            print(f"🚪 Track {tid} ({obj['class']}) SALIÓ del ROI en frame {frame_idx}")
+                            print(f"   Frames dentro: {frames_inside}")
+                            print(f"   Centro: {current_pos}")
+                            print(f"   Consecutive outside: {obj['consecutive_outside']}")
+                elif prev_state == 'outside':
+                    obj['state'] = 'outside'
             
-            # Contar inmediatamente si está saliendo (redundante por seguridad)
-            if prev_state == 'inside' and new_state == 'outside':
-                self.count_vehicle_exit(tid, frame_idx)
-    
-
-
-
+            # Debug: mostrar cambio de estado
+            if self.debug_mode and prev_state != obj['state']:
+                print(f"🔄 Track {tid} cambió de {prev_state} a {obj['state']}")
+        
+        # Procesar vehículos que salieron
+        for tid in exit_candidates:
+            if tid in self.active_tracks:
+                if self.count_vehicle_exit(tid, frame_idx):
+                    # Marcar para eliminación inmediata
+                    self.active_tracks[tid]['marked_for_removal'] = True
+                elif self.debug_mode:
+                    print(f"❌ Conteo FALLIDO para track {tid}")
+        
+        # Eliminar tracks contados inmediatamente
+        for tid in list(self.active_tracks.keys()):
+            if self.active_tracks[tid].get('marked_for_removal', False):
+                del self.active_tracks[tid]
+                if tid in self.track_history:
+                    del self.track_history[tid]
+                if self.debug_mode:
+                    print(f"🗑️ Track {tid} eliminado después de conteo")
 
     async def send_jarvis(self, base64_img: str, text: str):
         """Envía una imagen a un servidor de manera asíncrona"""
@@ -471,8 +448,6 @@ class VehicleProcessor:
             except Exception as e:
                 logger.error(f"Error en envío: {e}")
                 raise
-    
-
 
     def send_jarvis_wrapper(self, base64_img: str, text: str):
         """Envía una imagen en un hilo separado"""
@@ -494,11 +469,9 @@ class VehicleProcessor:
         thread = threading.Thread(target=send_async)
         thread.daemon = True
         thread.start()
-    
-
 
     def save_exit_photo(self, frame: np.ndarray, vehicle_type: str, vehicle_id: int):
-        """Guarda una foto del auto lavado y la envía"""
+        """Guarda una foto del vehículo lavado y la envía"""
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"{vehicle_type}_lavado_{vehicle_id}_{timestamp}.jpg"
         filepath = os.path.join(self.car_exit_dir, filename)
@@ -507,92 +480,99 @@ class VehicleProcessor:
             success, buffer = cv2.imencode('.jpg', frame, encode_params)
             if success:
                 imagen_base64 = base64.b64encode(buffer).decode('utf-8')
-                self.send_jarvis_wrapper(imagen_base64, f'Auto lavado #{self.autos_lavados} - ID: {vehicle_id}')
+                self.send_jarvis_wrapper(imagen_base64, 
+                    f'{vehicle_type.capitalize()} lavado #{self.autos_lavados} - ID: {vehicle_id}')
                 with open(filepath, 'wb') as f:
                     f.write(buffer)
-                logger.info(f"Auto lavado guardado: {filename}")
+                logger.info(f"Vehículo lavado guardado: {filename}")
             return True
         except Exception as e:
             logger.error(f"No se pudo guardar la foto: {e}")
             return False
-    
-
 
     def draw_detections(self, image: np.ndarray) -> np.ndarray:
-        """Dibuja SOLO tracks activos con información de estado mejorada"""
-        # Colores
-        CLR_TRACK = (0, 165, 255)       # Naranja
-        CLR_CONFIRMED = (0, 255, 0)     # Verde
-        CLR_ROI = (0, 255, 255)         # Amarillo
-        CLR_VERTEX = (255, 0, 0)        # Azul para vértices
-        CLR_UNCONFIRMED = (128, 128, 128) # Gris para no confirmados
-        CLR_COUNTED = (255, 0, 255)     # Magenta para contados
+        """Dibuja SOLO tracks que están dentro del ROI"""
+        CLR_CAR = (0, 165, 255)
+        CLR_TRUCK = (255, 0, 0)
+        CLR_MOTORCYCLE = (0, 255, 255)
+        CLR_ROI = (0, 255, 255)
+        CLR_VERTEX = (255, 0, 0)
+        CLR_INSIDE = (0, 255, 0)
+        CLR_COUNTED = (255, 0, 255)
         
         # Dibujar ROI
+        roi_overlay = image.copy()
+        cv2.fillPoly(roi_overlay, [self.roi_polygon], (0, 255, 255, 100))
+        cv2.addWeighted(roi_overlay, 0.3, image, 0.7, 0, image)
         cv2.polylines(image, [self.roi_polygon], isClosed=True, color=CLR_ROI, thickness=3)
         
-        # Dibujar vértices del ROI
         for x, y in self.roi_polygon:
-            cv2.circle(image, (x, y), 6, CLR_VERTEX, -1)
+            cv2.circle(image, (x, y), 8, CLR_VERTEX, -1)
+            cv2.circle(image, (x, y), 8, (255, 255, 255), 2)
         
-        # SOLO dibujar tracks ACTIVOS
+        # SOLO dibujar tracks que están DENTRO del ROI
         for tid, obj in list(self.active_tracks.items()):
+            if obj.get('state') != 'inside':
+                continue  # Solo dibujar tracks dentro
+            
             x1, y1, x2, y2 = [int(v) for v in obj['box']]
+            vehicle_class = obj['class']
+            frames_inside = obj.get('frames_inside_roi', 0)
+            consecutive_inside = obj.get('consecutive_inside', 0)
             
-            confirmed = obj['seen_frames'] >= self.min_consec_frames
-            counted = obj.get('counted_exit', False)
-            
-            if counted:
-                color = CLR_COUNTED
-                state_text = "CONTADO"
-            elif not confirmed:
-                color = CLR_UNCONFIRMED
-                state_text = "NO CONFIRMADO"
-            elif obj.get('state') == 'inside':
-                color = CLR_CONFIRMED
-                state_text = "DENTRO ROI"
+            if vehicle_class == 'car':
+                color = CLR_CAR
+                type_text = "CAR"
+            elif vehicle_class == 'truck':
+                color = CLR_TRUCK
+                type_text = "TRUCK"
+            elif vehicle_class == 'motorcycle':
+                color = CLR_MOTORCYCLE
+                type_text = "MOTO"
             else:
-                color = CLR_TRACK
-                state_text = "FUERA ROI"
+                color = (128, 128, 128)
+                type_text = vehicle_class.upper()
             
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
             
-            # Dibujar historial si está confirmado
-            if tid in self.track_history and confirmed:
-                history = self.track_history[tid]
-                for i in range(1, len(history)):
-                    pt1 = (int(history[i-1][0]), int(history[i-1][1]))
-                    pt2 = (int(history[i][0]), int(history[i][1]))
-                    cv2.line(image, pt1, pt2, color, 2)
+            cv2.circle(image, (int(obj['center'][0]), int(obj['center'][1])), 6, color, -1)
+            cv2.circle(image, (int(obj['center'][0]), int(obj['center'][1])), 6, (255, 255, 255), 1)
             
-            label = f"ID:{tid} {state_text}"
+            label = f"ID:{tid} {type_text} DENTRO"
             cv2.putText(image, label, (x1, max(y1 - 8, 0)), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            cv2.circle(image, (int(obj['center'][0]), int(obj['center'][1])), 4, color, -1)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            time_text = f"D:{frames_inside}f C:{consecutive_inside}"
+            cv2.putText(image, time_text, (x1, y2 + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
-        # Dibujar HUD mejorado
+        # Dibujar HUD con estadísticas
         overlay = image.copy()
-        cv2.rectangle(overlay, (5, 5), (400, 140), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, image, 0.4, 0, image)
+        cv2.rectangle(overlay, (5, 5), (500, 200), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
         
-        cv2.putText(image, f"AUTOS LAVADOS: {self.autos_lavados}", (15, 35), 
+        cv2.putText(image, f"🚗 VEHÍCULOS LAVADOS: {self.autos_lavados}", (15, 35), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
         
-        cv2.putText(image, f"Tracks activos: {len(self.active_tracks)}", (15, 65), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        if self.last_counted_frame > 0:
+            frames_since_last = self.frame_counter - self.last_counted_frame
+            cv2.putText(image, f"Último: ID {self.last_counted_id} ({frames_since_last}f)", 
+                       (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
         
-        cv2.putText(image, f"Frame: {self.frame_counter}", (15, 85), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(image, f"🚘 Carros: {self.car_count}", (15, 95), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, CLR_CAR, 2)
         
-        cv2.putText(image, f"Device: {self.device}", (15, 105), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(image, f"🚚 Camiones: {self.truck_count}", (15, 125), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, CLR_TRUCK, 2)
         
-        cv2.putText(image, f"ROI activo: {len(self.roi_polygon)} puntos", (15, 125), 
+        cv2.putText(image, f"🏍️ Motos: {self.motorcycle_count}", (15, 155), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, CLR_MOTORCYCLE, 2)
+        
+        inside_count = len([t for t in self.active_tracks.values() if t.get('state') == 'inside'])
+        cv2.putText(image, f"Tracks DENTRO: {inside_count}", (15, 185), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
         return image
-    
-
 
     def process_frame(self, image: np.ndarray, roi=None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
@@ -603,6 +583,8 @@ class VehicleProcessor:
         
         if roi is not None: 
             self.roi_polygon = np.array(roi, np.int32)
+            if self.debug_mode:
+                print(f"📍 ROI actualizado: {len(roi)} puntos")
 
         self.frame_counter += 1
         self.last_processed_frame = image.copy()
@@ -614,10 +596,11 @@ class VehicleProcessor:
                 imgsz=640,
                 conf=self.confidence_threshold,
                 iou=self.iou_threshold,
-                classes=[2, 7],  # car=2, truck=7
+                classes=[2, 3, 7],
                 persist=True,
                 tracker="bytetrack.yaml",
-                verbose=False
+                verbose=False,
+                max_det=50
             )
             
             detections = []
@@ -629,38 +612,57 @@ class VehicleProcessor:
                 
                 for i in range(boxes.shape[0]):
                     cid = int(cls[i])
-                    cname = 'car' if cid == 2 else ('truck' if cid == 7 else str(cid))
+                    if cid == 2:
+                        cname = 'car'
+                    elif cid == 3:
+                        cname = 'motorcycle'
+                    elif cid == 7:
+                        cname = 'truck'
+                    else:
+                        continue
+                    
                     boxg = boxes[i]
                     center = self.center_of(boxg)
                     
-                    # FILTRAR POR ROI
-                    if self.is_inside_polygon(center, self.roi_polygon.reshape((-1, 1, 2))):
+                    # Solo procesar detecciones que están DENTRO del ROI
+                    roi_polygon_points = self.roi_polygon.reshape((-1, 1, 2))
+                    if self.is_inside_polygon(center, roi_polygon_points):
                         detections.append({
                             'class': cname,
                             'box': boxg,
                             'center': center,
                             'confidence': confs[i] if i < len(confs) else 0.5
                         })
-
+            
+            if self.debug_mode and detections:
+                print(f"📊 Frame {self.frame_counter}: {len(detections)} detecciones DENTRO del ROI")
+            
             # Actualizar tracks
             active_tracks = self.update_tracks(detections, self.frame_counter)
             
             # Actualizar estado de vehículos
             self.update_vehicle_state(self.frame_counter)
             
+            # Verificación adicional: si un track lleva mucho tiempo dentro, forzar conteo
+            for tid, obj in list(self.active_tracks.items()):
+                if obj.get('state') == 'inside' and not obj.get('counted_exit', False):
+                    frames_inside = obj.get('frames_inside_roi', 0)
+                    if frames_inside > 30:  # Si lleva más de 30 frames dentro, forzar conteo
+                        if self.debug_mode:
+                            print(f"⚠️ Track {tid} lleva mucho tiempo dentro ({frames_inside}f), forzando conteo")
+                        self.count_vehicle_exit(tid, self.frame_counter)
+            
             # Debug periódico
-            if self.frame_counter % 30 == 0:
-                self.debug_tracking_info()
+            if self.debug_mode and self.frame_counter % 15 == 0:
+                self.debug_track_states()
             
             # Dibujar detecciones
             processed_image = self.draw_detections(image.copy())
             
             # Log del frame
-            self.log_detection(self.frame_counter, self.autos_lavados, flush=(self.frame_counter % 60 == 0))
+            self.log_detection(self.frame_counter, flush=(self.frame_counter % 30 == 0))
             
             # Preparar metadatos
-            confirmed_tracks = [tid for tid, obj in self.active_tracks.items() 
-                              if obj['seen_frames'] >= self.min_consec_frames]
             inside_tracks = [tid for tid, obj in self.active_tracks.items() 
                            if obj.get('state') == 'inside']
             
@@ -668,56 +670,119 @@ class VehicleProcessor:
                 'frame_number': self.frame_counter,
                 'vehicles_detected': len(detections),
                 'vehicles_washed': self.autos_lavados,
+                'car_count': self.car_count,
+                'truck_count': self.truck_count,
+                'motorcycle_count': self.motorcycle_count,
                 'active_tracks': len(self.active_tracks),
-                'confirmed_tracks': len(confirmed_tracks),
                 'inside_tracks': len(inside_tracks),
-                'timestamp': self.frame_counter,
-                'device': self.device,
-                'total_tracks_created': self.next_id - 1,
-                'roi_points': self.roi_polygon.tolist(),
-                'detections_in_frame': len(detections)
+                'last_counted_id': self.last_counted_id,
+                'last_counted_frame': self.last_counted_frame,
+                'debug_info': {
+                    'min_time_inside': self.min_time_inside,
+                    'min_consec_frames': self.min_consec_frames
+                }
             }
             
             return processed_image, metadata
             
         except Exception as e:
             logger.error(f"Error en procesamiento de frame: {e}")
+            import traceback
+            traceback.print_exc()
             return image, {'error': str(e)}
     
-    # ... (resto de métodos sin cambios: set_roi, reset_counter, get_stats, etc.)
-
+    def debug_track_states(self):
+        """Muestra el estado actual de todos los tracks"""
+        print(f"\n📋 ESTADO DE TRACKS - Frame {self.frame_counter}")
+        print(f"{'='*60}")
+        for tid, obj in sorted(self.active_tracks.items()):
+            state = obj.get('state', 'unknown')
+            counted = obj.get('counted_exit', False)
+            frames_inside = obj.get('frames_inside_roi', 0)
+            entry_frame = obj.get('entry_frame', 'N/A')
+            print(f"Track {tid}: {obj['class']} | Estado: {state} | Contado: {counted} | Frames dentro: {frames_inside} | Entry: {entry_frame}")
+        print(f"{'='*60}\n")
+    
     def debug_tracking_info(self):
         """Muestra información de debug sobre el tracking"""
-        print(f"\n=== DEBUG TRACKING INFO ===")
-        print(f"Frame: {self.frame_counter}")
-        print(f"Active tracks: {len(self.active_tracks)}")
+        print(f"\n{'='*60}")
+        print(f"📊 DEBUG TRACKING INFO - Frame: {self.frame_counter}")
+        print(f"{'='*60}")
         
-        inside_count = len([t for t in self.active_tracks.values() if t.get('state') == 'inside'])
-        confirmed_count = len([t for t in self.active_tracks.values() if t['seen_frames'] >= self.min_consec_frames])
-        counted_count = len([t for t in self.active_tracks.values() if t.get('counted_exit', False)])
+        inside_count = 0
+        for track in self.active_tracks.values():
+            if track.get('state') == 'inside':
+                inside_count += 1
         
-        print(f"Tracks inside ROI: {inside_count}")
-        print(f"Confirmed tracks: {confirmed_count}")
-        print(f"Counted tracks: {counted_count}")
-        print(f"Autos lavados: {self.autos_lavados}")
+        print(f"🔢 Tracks activos: {len(self.active_tracks)}")
+        print(f"📥 Tracks dentro ROI: {inside_count}")
+        print(f"🚗 Total vehículos lavados: {self.autos_lavados}")
+        print(f"📈 Estadísticas: Carros={self.car_count}, Camiones={self.truck_count}, Motos={self.motorcycle_count}")
         
-        roi_polygon_points = self.roi_polygon.reshape((-1, 1, 2))
-        for track_id, track in self.active_tracks.items():
-            state = track.get('state', 'unknown')
-            counted = track.get('counted_exit', False)
-            last_seen = self.frame_counter - track['last_seen']
-            is_inside = self.is_inside_polygon(track['center'], roi_polygon_points)
-            confirmed = track['seen_frames'] >= self.min_consec_frames
-            first_inside = track.get('first_inside_frame', 'N/A')
-            
-            status = "CONFIRMADO" if confirmed else "NO CONFIRMADO"
-            print(f"ID {track_id}: {status}, state={state}, counted={counted}, "
-                  f"inside_roi={is_inside}, frames={track['seen_frames']}, "
-                  f"first_inside={first_inside}")
+        if inside_count > 0:
+            print(f"\n📋 DETALLE DE TRACKS DENTRO DEL ROI:")
+            for tid, track in sorted(self.active_tracks.items()):
+                if track.get('state') == 'inside':
+                    frames_inside = track.get('frames_inside_roi', 0)
+                    consecutive_inside = track.get('consecutive_inside', 0)
+                    print(f"  ID {tid} ({track['class']}):")
+                    print(f"    Frames dentro: {frames_inside}")
+                    print(f"    Cons. dentro: {consecutive_inside}")
+                    print(f"    Frames totales: {track['seen_frames']}")
+                    print(f"    Entry frame: {track.get('entry_frame', 'N/A')}")
         
-        print("============================\n")
+        print(f"{'='*60}\n")
 
-# Función de utilidad para crear instancia del procesador
+    def set_roi(self, roi_points: List[Tuple[int, int]]):
+        """Establece una nueva región de interés (ROI)"""
+        self.roi_polygon = np.array(roi_points, np.int32)
+        print(f"✅ ROI actualizado a {len(roi_points)} puntos")
+        print(f"📍 ROI points: {roi_points}")
+
+    def reset_counter(self):
+        """Reinicia todos los contadores de vehículos"""
+        self.autos_lavados = 0
+        self.car_count = 0
+        self.truck_count = 0
+        self.motorcycle_count = 0
+        self.last_counted_frame = 0
+        self.last_counted_id = 0
+        print("🔄 Contadores de vehículos reiniciados")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Obtiene estadísticas actuales del procesador"""
+        inside_count = len([t for t in self.active_tracks.values() if t.get('state') == 'inside'])
+        
+        return {
+            'total_vehicles_washed': self.autos_lavados,
+            'car_count': self.car_count,
+            'truck_count': self.truck_count,
+            'motorcycle_count': self.motorcycle_count,
+            'frame_counter': self.frame_counter,
+            'active_tracks': len(self.active_tracks),
+            'inside_tracks': inside_count,
+            'last_counted_id': self.last_counted_id,
+            'last_counted_frame': self.last_counted_frame,
+            'roi_points': self.roi_polygon.tolist()
+        }
+
+    def force_count_vehicle(self, track_id: int):
+        """Fuerza el conteo de un vehículo específico (para debugging)"""
+        if track_id in self.active_tracks:
+            print(f"🔧 FORZANDO CONTEO MANUAL del track {track_id}")
+            if self.count_vehicle_exit(track_id, self.frame_counter):
+                print(f"✅ Conteo forzado EXITOSO para track {track_id}")
+            else:
+                print(f"❌ Conteo forzado FALLIDO para track {track_id}")
+        else:
+            print(f"❌ Track {track_id} no encontrado en active_tracks")
+
+    def toggle_debug_mode(self):
+        """Activa/desactiva el modo debug"""
+        self.debug_mode = not self.debug_mode
+        print(f"🔧 Modo debug {'ACTIVADO' if self.debug_mode else 'DESACTIVADO'}")
+
+
 def create_vehicle_processor(**kwargs) -> VehicleProcessor:
     """Crea y retorna una instancia configurada de VehicleProcessor"""
     return VehicleProcessor(**kwargs)
