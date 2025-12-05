@@ -9,8 +9,7 @@ import time
 import logging
 from ..analityc.core.inference_video import VehicleProcessor
 from ..analityc.config.config import get_config
-
-
+from ..analityc.core.hardware_available import device_hardware
 
 
 app = FastAPI()
@@ -32,22 +31,6 @@ current_image = None
 logger = logging.getLogger(__name__)
 
 
-
-
-async def startup_event():
-    """Inicializa el procesador al iniciar la aplicación"""
-    global vehicle_processor
-    try:
-        config = get_config()
-        vehicle_processor = VehicleProcessor(
-            model_path=config["model_path"],
-            confidence_threshold=config["confidence_threshold"],
-            iou_threshold=config["iou_threshold"],
-            device=config["device"]
-        )
-        logger.info("✅ VehicleProcessor inicializado correctamente")
-    except Exception as e:
-        logger.error(f"❌ Error inicializando VehicleProcessor: {e}")
         
 
 
@@ -56,15 +39,28 @@ def init_server():
     return {"status": "active"}
 
 
+
 @app.websocket('/ws')
 async def websocket_endpoint(websocket: WebSocket):
     """WebSocket para procesamiento en tiempo real"""
-    global vehicle_processor
     
     await websocket.accept()
-    logger.info("Cliente WebSocket conectado")
+    config = get_config()
     
-    await startup_event()
+    client_id = f'client_{id(websocket)}'
+    
+    vehicle_processor = VehicleProcessor(
+        client_id=client_id,
+        model_path=config["model_path"],
+        confidence_threshold=config["confidence_threshold"],
+        iou_threshold=config["iou_threshold"],
+        device=device_hardware.device_default
+    )
+
+
+    logger.info('Cliente WebSocket conectado')
+    
+
 
     if vehicle_processor is None:
         await websocket.send_text("Error: Procesador no inicializado")
