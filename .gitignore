@@ -3,6 +3,7 @@ venv/
 src/__pycache__/
 Car Exit/
 output/
+debugger/ouput/
 yolo11n.pt
 yolo11x.pt
 yolo11n.pt
