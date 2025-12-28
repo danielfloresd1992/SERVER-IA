@@ -3,7 +3,7 @@ from typing import Dict, Any
 
 # Configuración global
 APP_CONFIG: Dict[str, Any] = {
-    "model_path": "yolo11n.pt",
+    "model_path": "models/yolo11m.pt",
     "confidence_threshold": 0.3,
     "iou_threshold": 0.4,
     "device": "auto",

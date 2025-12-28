@@ -2,160 +2,200 @@ import json
 import base64
 import numpy as np
 import cv2
+import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-import threading
-import time
 import logging
-from ..analityc.core.inference_video import VehicleProcessor
+from concurrent.futures import ThreadPoolExecutor
+from ..analityc.core.Perimetrales import MultiObjectProcessor
+from ..analityc.core.car_washed import VehicleProcessor
 from ..analityc.config.config import get_config
 from ..analityc.core.hardware_available import device_hardware
+import time
 
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-origins = ['*']
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=['*'],
-    allow_headers=['*'],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Variable global para controlar la ventana de OpenCV
-window_open = False
-current_image = None
+# Thread pool para procesamiento pesado
+executor = ThreadPoolExecutor(max_workers=4)
 
-logger = logging.getLogger(__name__)
+# Diccionario para manejar múltiples clientes
+active_connections = {}
+connection_lock = asyncio.Lock()
 
 
+
+def process_image_sync(processor, img, roi, activate_roi):
+    """Función sincrónica para procesamiento de imágenes"""
+    try:
+        return processor.process_frame(img, roi, activate_roi)
+    except Exception as e:
+        logger.error(f"Error en procesamiento: {e}")
+        raise
+
+
+
+@app.websocket('/ws/{type_inference}')
+async def websocket_endpoint(websocket: WebSocket, type_inference: str):
+    await websocket.accept()
+    client_id = f'client_{id(websocket)}'
+    processor = None
+
+    # 1. Inicialización y Registro
+    try:
+        config = get_config()
+        # Mapeo de procesadores para evitar múltiples ifs
+        processors = {
+            'Lavado': VehicleProcessor,
+            'Perimetrales': MultiObjectProcessor
+        }
         
+        processor_class = processors.get(type_inference)
+        if processor_class:
+            processor = processor_class(
+                client_id=client_id,
+                model_path=config["model_path"],
+                confidence_threshold=config["confidence_threshold"],
+                iou_threshold=config["iou_threshold"],
+                device=device_hardware.device_default['gpu_use']
+            )
+
+        async with connection_lock:
+            active_connections[client_id] = {
+                'websocket': websocket,
+                'processor': processor,
+                'last_active': time.time()
+            }
+        
+
+        # Enviar mensaje de bienvenida
+        await websocket.send_text(json.dumps({
+            'id_connection': id(websocket),
+            'event': 'conection_init',
+            'type_inference': type_inference,
+            'data': {'roy': False}
+        }))
+
+
+        # 2. Bucle Principal
+        WEBSOCKET_TIMEOUT = 30.0
+        while True:
+            raw_message = await asyncio.wait_for(websocket.receive_text(), timeout=WEBSOCKET_TIMEOUT)
+            request = json.loads(raw_message)
+            data = request['data']
+
+            try:
+                start_time = time.time()
+                
+                # --- PROCESAMIENTO LINEAL ---
+                # Si cualquiera de estas líneas falla, salta al 'except (json.JSONDecodeError, KeyError, ...)'
+                
+                # Validar campos requeridos y asignar variables
+                image_data = data['image']
+
+                roi = data.get('roi_coordinates', '')
+                roi_activate = data['roi_activate']
+           
+
+
+                # Decodificar imagen
+                if ',' in image_data:
+                    image_data = image_data.split(',')[1]
+                
+                image_bytes = base64.b64decode(image_data)
+                image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+                img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+                
+                if img is None:
+                    raise ValueError("Imagen corrupta o formato inválido")
+
+                # Inferencia (Thread Pool)20
+                loop = asyncio.get_event_loop()
+                processed_img, metadata = await loop.run_in_executor(
+                    executor, process_image_sync, processor, img, roi, roi_activate
+                )
+
+                # Codificar y Enviar
+                success, encoded_image = cv2.imencode('.jpg', processed_img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if not success:
+                    raise ValueError("Error en la codificación de salida")
+
+                processed_base64 = base64.b64encode(encoded_image.tobytes()).decode('utf-8')
+
+
+                request['data'] = {
+                        "status": "success",
+                        "metadata": metadata,
+                        "processed_image": f"data:image/jpeg;base64,{processed_base64}",
+                        "processing_time": round(time.time() - start_time, 3)
+                    }
+                await websocket.send_json(request)
+
+
+                # Actualizar actividad
+                async with connection_lock:
+                    if client_id in active_connections:
+                        active_connections[client_id]['last_active'] = time.time()
+
+
+            # --- MANEJO DE ERRORES DEL BUCLE ---
+            except asyncio.TimeoutError:
+                try:
+                    await websocket.send_text(json.dumps({"status": "ping"}))
+                except: break
+
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                # Captura errores de datos, JSON mal formado o claves faltantes (como component_id)
+                logger.error(f"Error de validación: {e}")
+                request['data'] = {"status": "error", "message": str(e)}
+                await websocket.send_json(request)
+
+
+            except WebSocketDisconnect:
+                break
+
+    except Exception as e:
+        logger.error(f"Error crítico en {client_id}: {e}")
+    
+    finally:
+        # 3. Limpieza única al cerrar
+        async with connection_lock:
+            active_connections.pop(client_id, None)
+        if processor and hasattr(processor, 'cleanup'):
+            processor.cleanup()
+        logger.info(f"Cliente {client_id} desconectado.")
+
+
+
+
+
 
 
 @app.get('/')
 def init_server():
-    return {"status": "active"}
+    return {"status": "active", "connections": len(active_connections)}
 
 
 
-@app.websocket('/ws')
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket para procesamiento en tiempo real"""
-    
-    await websocket.accept()
-    config = get_config()
-    
-    client_id = f'client_{id(websocket)}'
-    
-    vehicle_processor = VehicleProcessor(
-        client_id=client_id,
-        model_path=config["model_path"],
-        confidence_threshold=config["confidence_threshold"],
-        iou_threshold=config["iou_threshold"],
-        device=device_hardware.device_default
-    )
 
-
-    logger.info('Cliente WebSocket conectado')
-    
-
-
-    if vehicle_processor is None:
-        await websocket.send_text("Error: Procesador no inicializado")
-        await websocket.close()
-        return
-    
-    try:
-        while True:
-            raw_message = await websocket.receive_text()
-            
-            if not raw_message.strip():
-                await websocket.send_text("Error: Mensaje vacío")
-                continue
-            
-            try:
-                data = json.loads(raw_message)
-                logger.info(f"JSON recibido - Timestamp: {data.get('header', {}).get('timestamp')}")
-                
-                # Procesar la imagen
-                image_data = data.get('image', '')
-                roi = data.get('roi_coordinates', '')
-                print(roi)
-                ##
-                if image_data:
-                    # Decodificar base64
-                    if ',' in image_data:
-                        image_data = image_data.split(',')[1]
-                    
-                    image_bytes = base64.b64decode(image_data)
-                    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
-                    img = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-                    
-                    if img is not None:
-                        # Procesar frame
-                        processed_img, metadata = vehicle_processor.process_frame(img, roi)
-                        
-                        # Codificar resultado como JPG
-                        success, encoded_image = cv2.imencode('.jpg', processed_img, 
-                                                             [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        
-                        if success:
-                            processed_base64 = base64.b64encode(encoded_image.tobytes()).decode('utf-8')
-                            response = {
-                                "status": "success",
-                                "metadata": metadata,
-                                "processed_image": f"data:image/jpeg;base64,{processed_base64}"
-                            }
-                            await websocket.send_text(json.dumps(response))
-                            print('procesamiento activo')
-                        else:
-                            await websocket.send_text(json.dumps({
-                                "status": "error", 
-                                "message": "Error codificando imagen"
-                            }))
-                            print('Error codificando imagen')
-                    else:
-                        await websocket.send_text(json.dumps({
-                            "status": "error", 
-                            "message": "Error decodificando imagen"
-                        }))
-                        print('Error decodificando imagen')
-                else:
-                    await websocket.send_text(json.dumps({
-                        "status": "error", 
-                        "message": "No hay datos de imagen"
-                    }))
-                    print('No hay datos de imagen')
-                 
-            except json.JSONDecodeError as e:
-                logger.error(f"Error JSON: {e}")
-                await websocket.send_text(json.dumps({
-                    "status": "error", 
-                    "message": f"Error en formato JSON: {str(e)}"
-                }))
-                print(f"Error en formato JSON: {str(e)}")
-                
-
-
-    except WebSocketDisconnect:
-        logger.info('Cliente WebSocket desconectado')
-    except Exception as e:
-        logger.error(f"Error general en WebSocket: {e}")
-    
-
-
-
-        
-
-# Manejo de cierre limpio
-import atexit
-
-@atexit.register
-def cleanup():
-    global window_open
-    window_open = False
-    cv2.destroyAllWindows()
-    print("Limpieza realizada")
-
+@app.get('/health')
+def health_check():
+    """Endpoint para verificar estado del servidor"""
+    return {
+        "status": "active",
+        "connections": len(active_connections),
+        "thread_pool": {
+            "active_threads": executor._work_queue.qsize() if hasattr(executor, '_work_queue') else "unknown"
+        }
+    }

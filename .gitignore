@@ -1,9 +1,14 @@
 venv/
 .env
 src/__pycache__/
+src/analityc/core/__pycache__/
 Car Exit/
+env/
+debugger/
+train/__pycache__/
 output/
 debugger/ouput/
+yolo11n.pt
 yolo11n.pt
 yolo11x.pt
 yolo11n.pt
