@@ -1,0 +1,14 @@
+torch>=2.10.0
+torchvision
+torchaudio
+torchreid
+ultralytics
+opencv-python
+numpy
+scipy
+gdown
+tensorboard
+
+# Notes:
+# - For GPU support install a CUDA-enabled torch wheel matching your CUDA toolkit (example: torch==2.10.0+cu130).
+# - If using Windows, prefer installing the torch wheel from the official PyTorch site for your CUDA version.
