@@ -30,7 +30,7 @@ class Device_hardware:
 
                 self.gpu_tuple = tuple(list)
                 self.gpu_available = True
-                self.device_default = self.gpu_tuple[0]
+                self.device_default = self.gpu_tuple[0]['gpu_use']
             else:
                 self.gpu_tuple = []
                 self.gpu_available = False
@@ -38,9 +38,11 @@ class Device_hardware:
 
 
     def seletec_divice(self, number: int):
-        if self.gpu_tuple.count < 1: return None
-        if number >= self.gpu_tuple.count: return None
-        self.device_default = self.gpu_tuple[number]
+        if len(self.gpu_tuple) < 1:
+            return None
+        if number >= len(self.gpu_tuple):
+            return None
+        self.device_default = self.gpu_tuple[number]['gpu_use']
 
 
 

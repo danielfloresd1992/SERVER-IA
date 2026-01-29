@@ -20,14 +20,20 @@ logger = logging.getLogger(__name__)
 
 
 class MultiObjectProcessor:
-    """Procesador de múltiples objetos con reconocimiento de colores EXACTO"""
+    """Procesador de múltiples objetos"""
+
+    _shared_model = None
+    _shared_model_lock = threading.Lock()
     
     def __init__(self, 
                 client_id: None = None,
-                model_path: str = "yolo11x.pt",
+                model_path: str = "yolov26l.pt",
                 confidence_threshold: float = 0.6,
+                vehicle_confidence_threshold: float = 0.45,
+                person_confidence_threshold: float = 0.6,
                 iou_threshold: float = 0.4,
                 device: str = 'cpu',
+                share_model: bool = True,
                 log_file: str = "output/detection_log.txt",
                 car_exit_dir: str = "output/Car_Exit",
                 image_quality: int = 50,
@@ -40,8 +46,12 @@ class MultiObjectProcessor:
                 max_image_size: tuple = (640, 480)):
         
         self.confidence_threshold = confidence_threshold
+        self.vehicle_confidence_threshold = vehicle_confidence_threshold
+        self.person_confidence_threshold = person_confidence_threshold
         self.iou_threshold = iou_threshold
         self.model_path = model_path
+        self.share_model = share_model
+        self.client_id = client_id
         self.log_file = log_file
         self.car_exit_dir = car_exit_dir
         self.image_quality = image_quality
@@ -73,6 +83,15 @@ class MultiObjectProcessor:
         
         # ROI por defecto
         self.roi_polygon = np.array(DEFAULT_ROI if DEFAULT_ROI else [(0, 0), (640, 0), (640, 480), (0, 480)], np.int32)
+        # ROI de puerta (para entrada/salida de personal)
+        self.door_polygon = None
+        self.door_active = False
+        self.door_alert_cooldown = 2.0
+        self.door_last_alert_time = defaultdict(float)
+        self.door_class_names = ["door", "puerta"]
+        self._door_class_ids = None
+        self.door_direction = None
+        self.door_direction_active = False
         
         # Para evitar reconteo
         self.counted_tracks = set()
@@ -108,177 +127,6 @@ class MultiObjectProcessor:
         }
         
 
-        # Diccionario de colores en español (COMPLETO)
-        self.color_names_es = {
-            'red': 'rojo',
-            'rojo': 'rojo',
-            'crimson': 'carmesí',
-            'scarlet': 'escarlata',
-            'ruby': 'rubí',
-            'cherry': 'cereza',
-            'burgundy': 'burdeos',
-            'maroon': 'granate',
-            'blue': 'azul',
-            'azul': 'azul',
-            'navy': 'azul marino',
-            'royal_blue': 'azul real',
-            'sky_blue': 'azul cielo',
-            'turquoise': 'turquesa',
-            'teal': 'verde azulado',
-            'cyan': 'cian',
-            'green': 'verde',
-            'verde': 'verde',
-            'lime': 'lima',
-            'olive': 'oliva',
-            'emerald': 'esmeralda',
-            'forest_green': 'verde bosque',
-            'yellow': 'amarillo',
-            'amarillo': 'amarillo',
-            'gold': 'dorado',
-            'amber': 'ámbar',
-            'mustard': 'mostaza',
-            'orange': 'naranja',
-            'naranja': 'naranja',
-            'coral': 'coral',
-            'peach': 'durazno',
-            'tangerine': 'mandarina',
-            'purple': 'morado',
-            'morado': 'morado',
-            'violet': 'violeta',
-            'lavender': 'lavanda',
-            'lilac': 'lila',
-            'plum': 'ciruela',
-            'pink': 'rosa',
-            'rosa': 'rosa',
-            'magenta': 'magenta',
-            'hot_pink': 'rosa fuerte',
-            'salmon': 'salmón',
-            'brown': 'café',
-            'cafe': 'café',
-            'chocolate': 'chocolate',
-            'caramel': 'caramelo',
-            'tan': 'marrón claro',
-            'beige': 'beige',
-            'black': 'negro',
-            'negro': 'negro',
-            'charcoal': 'carbón',
-            'onyx': 'ónix',
-            'white': 'blanco',
-            'blanco': 'blanco',
-            'ivory': 'marfil',
-            'cream': 'crema',
-            'gray': 'gris',
-            'gris': 'gris',
-            'silver': 'plateado',
-            'ash_gray': 'gris ceniza',
-            'slate_gray': 'gris pizarra',
-            'silver_metallic': 'plateado metálico',
-            'gold_metallic': 'dorado metálico',
-            'bronze_metallic': 'bronce metálico',
-            'unknown': 'desconocido',
-            'desconocido': 'desconocido'
-        }
-        
-
-
-        # PALETA DE COLORES EXACTA CON VALORES HSV ESPECÍFICOS
-        self.color_ranges_hsv = {
-            # ROJOS
-            'red': [(0, 150, 50), (10, 255, 255), (170, 150, 50), (180, 255, 255)],
-            'crimson': [(0, 180, 60), (5, 255, 200), (175, 180, 60), (180, 255, 200)],
-            'scarlet': [(0, 200, 150), (8, 255, 255)],
-            'ruby': [(0, 180, 100), (10, 255, 200)],
-            'cherry': [(170, 150, 80), (180, 255, 200)],
-            'burgundy': [(150, 100, 40), (180, 255, 120)],
-            'maroon': [(0, 100, 30), (10, 200, 100), (170, 100, 30), (180, 200, 100)],
-            
-            # AZULES
-            'blue': [(90, 100, 50), (130, 255, 255)],
-            'navy': [(100, 150, 30), (140, 255, 120)],
-            'royal_blue': [(100, 150, 100), (130, 255, 200)],
-            'sky_blue': [(90, 50, 150), (120, 150, 255)],
-            'turquoise': [(75, 100, 100), (95, 255, 255)],
-            'teal': [(85, 100, 50), (105, 255, 200)],
-            'cyan': [(85, 100, 150), (95, 255, 255)],
-            
-            # VERDES
-            'green': [(40, 100, 50), (80, 255, 255)],
-            'lime': [(50, 150, 150), (70, 255, 255)],
-            'olive': [(30, 100, 50), (50, 200, 150)],
-            'emerald': [(70, 150, 100), (85, 255, 200)],
-            'forest_green': [(50, 100, 40), (70, 255, 150)],
-            
-            # AMARILLOS
-            'yellow': [(20, 100, 150), (30, 255, 255)],
-            'gold': [(25, 100, 150), (35, 255, 220)],
-            'amber': [(25, 150, 150), (35, 255, 255)],
-            'mustard': [(35, 100, 100), (45, 200, 200)],
-            
-            # NARANJAS
-            'orange': [(10, 150, 150), (20, 255, 255)],
-            'coral': [(5, 100, 150), (15, 255, 255)],
-            'peach': [(15, 50, 180), (25, 150, 255)],
-            'tangerine': [(10, 180, 180), (20, 255, 255)],
-            
-            # MORADOS
-            'purple': [(130, 100, 80), (150, 255, 200)],
-            'violet': [(120, 100, 100), (140, 255, 200)],
-            'lavender': [(130, 50, 150), (150, 150, 255)],
-            'lilac': [(140, 50, 150), (160, 150, 255)],
-            'plum': [(145, 100, 80), (160, 255, 180)],
-            
-            # ROSAS
-            'pink': [(150, 50, 150), (170, 200, 255)],
-            'magenta': [(145, 150, 150), (155, 255, 255)],
-            'hot_pink': [(160, 150, 150), (170, 255, 255)],
-            'salmon': [(5, 50, 180), (15, 150, 255)],
-            
-            # CAFÉS
-            'brown': [(10, 100, 30), (20, 200, 150)],
-            'chocolate': [(10, 100, 30), (20, 200, 120)],
-            'caramel': [(20, 100, 100), (30, 200, 200)],
-            'tan': [(20, 50, 150), (30, 150, 220)],
-            'beige': [(20, 30, 180), (30, 80, 240)],
-            
-            # NEGROS
-            'black': [(0, 0, 0), (180, 255, 40)],
-            'charcoal': [(0, 0, 30), (180, 50, 80)],
-            'onyx': [(0, 0, 10), (180, 50, 30)],
-            
-            # BLANCOS
-            'white': [(0, 0, 220), (180, 30, 255)],
-            'ivory': [(20, 10, 220), (40, 50, 255)],
-            'cream': [(25, 20, 220), (35, 80, 255)],
-            
-            # GRISES
-            'gray': [(0, 0, 80), (180, 30, 180)],
-            'ash_gray': [(0, 0, 100), (180, 30, 150)],
-            'slate_gray': [(0, 0, 60), (180, 30, 120)],
-            
-            # METÁLICOS
-            'silver': [(0, 0, 150), (180, 30, 220)],
-            'silver_metallic': [(0, 0, 180), (180, 50, 220)],
-            'gold_metallic': [(25, 50, 150), (35, 150, 220)],
-            'bronze_metallic': [(15, 50, 100), (25, 150, 180)]
-        }
-        
-        # Mapeo de colores principales para agrupación
-        self.color_groups = {
-            'rojo': ['red', 'crimson', 'scarlet', 'ruby', 'cherry', 'burgundy', 'maroon'],
-            'azul': ['blue', 'navy', 'royal_blue', 'sky_blue', 'turquoise', 'teal', 'cyan'],
-            'verde': ['green', 'lime', 'olive', 'emerald', 'forest_green'],
-            'amarillo': ['yellow', 'gold', 'amber', 'mustard'],
-            'naranja': ['orange', 'coral', 'peach', 'tangerine'],
-            'morado': ['purple', 'violet', 'lavender', 'lilac', 'plum'],
-            'rosa': ['pink', 'magenta', 'hot_pink', 'salmon'],
-            'cafe': ['brown', 'chocolate', 'caramel', 'tan', 'beige'],
-            'negro': ['black', 'charcoal', 'onyx'],
-            'blanco': ['white', 'ivory', 'cream'],
-            'gris': ['gray', 'ash_gray', 'slate_gray'],
-            'plateado': ['silver', 'silver_metallic'],
-            'dorado': ['gold_metallic'],
-            'bronce': ['bronze_metallic']
-        }
         
         # Para controlar que no se envíen múltiples fotos del mismo evento
         self.sent_entry_photos = defaultdict(lambda: deque(maxlen=2))
@@ -290,9 +138,18 @@ class MultiObjectProcessor:
         
         # Para controlar alertas periódicas
         self.alert_minutes_sent = defaultdict(list)  # {track_id: [minutos_enviados]}
-        
+
+        # Cola de alertas en metadata para que el cliente las consuma (no envío por red)
+        self.pending_alerts = deque(maxlen=500)
+        # Si True, no se llamará a `send_jarvis_wrapper` y la alerta quedará en `pending_alerts`
+        self.emit_alerts_via_metadata = True
+        # Lock para sincronizar acceso a la cola de alertas (puede accederse desde hilos)
+        self.pending_alerts_lock = threading.Lock()
+        # Máximo de alertas a enviar por frame
+        self.max_alerts_per_frame = 1
         self.model = None
         self.device = device
+        self._camera_processors = {}
         self._initialize_model()
         
         os.makedirs(self.car_exit_dir, exist_ok=True)
@@ -302,14 +159,15 @@ class MultiObjectProcessor:
         
 
 
+
         print(f'Modelo inicializado para {client_id}')
         print(f'Analisis procesado desde: {self.device}')
         print(f'🔔 Modo: Alertas a los 1, 3, 6, 9... minutos')
         print(f'🚫 Animales ignorados')
-        print(f'🎯 Confianza aumentada: {confidence_threshold}')
+        print(f'🎯 Confianza base: {confidence_threshold}')
+        print(f'🚗 Confianza vehículos: {vehicle_confidence_threshold}')
+        print(f'👤 Confianza personas: {person_confidence_threshold}')
         print(f'⏱️  Alertas: 1 minuto, luego cada 3 minutos')
-        print(f'🌈 Reconocimiento de colores EXACTO activado')
-        print(f'🎨 Paleta de colores: {len(self.color_ranges_hsv)} colores específicos')
 
 
 
@@ -317,7 +175,21 @@ class MultiObjectProcessor:
     def _initialize_model(self):
         try:
             print(f"🚀 Inicializando modelo YOLO en {self.device}...")
-            self.model = YOLO(self.model_path).to(self.device)
+            # Reutilizar modelo compartido si existe
+            if self.share_model and MultiObjectProcessor._shared_model is not None:
+                self.model = MultiObjectProcessor._shared_model
+                return
+
+            model = YOLO(self.model_path)
+            try:
+                model = model.to(self.device)
+            except Exception:
+                pass
+            self.model = model
+            if self.share_model:
+                with MultiObjectProcessor._shared_model_lock:
+                    if MultiObjectProcessor._shared_model is None:
+                        MultiObjectProcessor._shared_model = self.model
             dummy_input = np.zeros((320, 320, 3), dtype=np.uint8)
             _ = self.model.predict(
                 dummy_input, imgsz=320, device=self.device,
@@ -329,14 +201,50 @@ class MultiObjectProcessor:
             raise
 
 
+    def _get_door_class_ids(self) -> List[int]:
+        if self._door_class_ids is not None:
+            return self._door_class_ids
+
+        ids = []
+        try:
+            names = getattr(self.model, 'names', None)
+            if isinstance(names, dict):
+                name_to_id = {str(v).lower(): int(k) for k, v in names.items()}
+            elif isinstance(names, list):
+                name_to_id = {str(v).lower(): i for i, v in enumerate(names)}
+            else:
+                name_to_id = {}
+
+            for n in self.door_class_names:
+                key = str(n).lower()
+                if key in name_to_id:
+                    ids.append(name_to_id[key])
+        except Exception:
+            ids = []
+
+        self._door_class_ids = ids
+        return ids
+
+
+    def _update_door_from_detections(self, door_detections: List[Dict[str, Any]]):
+        if not door_detections:
+            return
+
+        best = max(door_detections, key=lambda d: d.get('confidence', 0.0))
+        x1, y1, x2, y2 = [int(v) for v in best['box']]
+        self.door_polygon = np.array([(x1, y1), (x2, y1), (x2, y2), (x1, y2)], np.int32)
+        self.door_active = True
+
+
 
 
     def setup_log_file(self):
         try:
             with open(self.log_file, 'w', encoding="utf-8") as f:
-                f.write("Timestamp,Frame,Vehiculos_Area,Cars,Trucks,Motorcycles,Personas_Dentro,Personas_Area,Evento,Color_Exacto,Color_General,Tiempo_Acumulado\n")
+                f.write("Timestamp,Frame,Vehiculos_Area,Cars,Trucks,Motorcycles,Personas_Dentro,Personas_Area,Evento,Tiempo_Acumulado\n")
         except Exception as e:
             print(f"❌ Error creando archivo de log: {e}")
+
 
 
 
@@ -353,13 +261,17 @@ class MultiObjectProcessor:
         union_area = box1_area + box2_area - inter_area
         return inter_area / union_area if union_area > 0 else 0
 
+
     def center_of(self, box: Tuple) -> Tuple[float, float]:
         """Calcula el centro de un bounding box"""
         x1, y1, x2, y2 = box
         return ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
 
+
     def is_inside_polygon(self, point: Tuple, polygon: np.ndarray) -> bool:
         return cv2.pointPolygonTest(polygon, (int(point[0]), int(point[1])), False) >= 0
+
+
 
     def compress_image(self, image: np.ndarray) -> np.ndarray:
         """Comprime la imagen para reducir el tamaño del payload"""
@@ -387,178 +299,7 @@ class MultiObjectProcessor:
 
 
 
-    def detect_exact_color(self, image: np.ndarray, box: Tuple, object_type: str) -> Tuple[str, str]:
-        """
-        Detecta el color EXACTO y su categoría general.
-        Retorna: (color_exacto, color_general)
-        """
-        try:
-            x1, y1, x2, y2 = [int(v) for v in box]
-            
-            # Asegurar que las coordenadas estén dentro de la imagen
-            height, width = image.shape[:2]
-            x1 = max(0, min(x1, width - 1))
-            y1 = max(0, min(y1, height - 1))
-            x2 = max(0, min(x2, width - 1))
-            y2 = max(0, min(y2, height - 1))
-            
-            if x2 <= x1 or y2 <= y1:
-                return "desconocido", "desconocido"
-            
-            # Recortar la región de interés
-            roi = image[y1:y2, x1:x2]
-            
-            if roi.size == 0:
-                return "desconocido", "desconocido"
-            
-            # Para personas, analizar solo la parte superior (camisa)
-            if object_type == 'person':
-                # Tomar el 60% superior del bounding box
-                person_height = y2 - y1
-                shirt_height = int(person_height * 0.6)
-                if shirt_height > 0:
-                    roi = roi[0:shirt_height, :]
-            
-            if roi.size == 0:
-                return "desconocido", "desconocido"
-            
-            # Convertir a espacio de color HSV
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            
-            # Aplicar blur para reducir ruido
-            hsv = cv2.GaussianBlur(hsv, (7, 7), 0)
-            
-            # Calcular histograma de colores
-            h_hist = cv2.calcHist([hsv], [0], None, [180], [0, 180])
-            s_hist = cv2.calcHist([hsv], [1], None, [256], [0, 256])
-            v_hist = cv2.calcHist([hsv], [2], None, [256], [0, 256])
-            
-            # Normalizar histogramas
-            h_hist = cv2.normalize(h_hist, h_hist).flatten()
-            s_hist = cv2.normalize(s_hist, s_hist).flatten()
-            v_hist = cv2.normalize(v_hist, v_hist).flatten()
-            
-            # Encontrar el tono dominante
-            dominant_hue = np.argmax(h_hist)
-            avg_saturation = np.mean(hsv[:,:,1])
-            avg_value = np.mean(hsv[:,:,2])
-            
-            # Detección especial para colores extremos
-            if avg_value < 40 and avg_saturation < 50:
-                return "black", "negro"
-            
-            if avg_value > 200 and avg_saturation < 30:
-                return "white", "blanco"
-            
-            if avg_saturation < 30 and 50 < avg_value < 200:
-                return "gray", "gris"
-            
-            # Buscar el color exacto que mejor coincida
-            best_color = "desconocido"
-            best_score = 0
-            
-            for color_name, ranges in self.color_ranges_hsv.items():
-                total_pixels = 0
-                matched_pixels = 0
-                
-                if len(ranges) == 2:
-                    lower = np.array(ranges[0])
-                    upper = np.array(ranges[1])
-                    mask = cv2.inRange(hsv, lower, upper)
-                    matched_pixels = cv2.countNonZero(mask)
-                    total_pixels = roi.shape[0] * roi.shape[1]
-                    
-                elif len(ranges) == 4:
-                    lower1 = np.array(ranges[0])
-                    upper1 = np.array(ranges[1])
-                    lower2 = np.array(ranges[2])
-                    upper2 = np.array(ranges[3])
-                    mask1 = cv2.inRange(hsv, lower1, upper1)
-                    mask2 = cv2.inRange(hsv, lower2, upper2)
-                    mask = cv2.bitwise_or(mask1, mask2)
-                    matched_pixels = cv2.countNonZero(mask)
-                    total_pixels = roi.shape[0] * roi.shape[1]
-                
-                if total_pixels > 0:
-                    match_percentage = matched_pixels / total_pixels
-                    # Ajustar score considerando saturación y valor
-                    h_match = 1.0 - (abs(dominant_hue - np.mean([ranges[0][0], ranges[-1][0] if len(ranges)==2 else ranges[2][0]])) / 180)
-                    final_score = match_percentage * 0.7 + h_match * 0.3
-                    
-                    if final_score > best_score and final_score > 0.2:
-                        best_score = final_score
-                        best_color = color_name
-            
-            # Si no se encuentra color específico, intentar con grupos generales
-            if best_color == "desconocido":
-                # Determinar color general basado en el tono dominante
-                if 0 <= dominant_hue <= 15 or 165 <= dominant_hue <= 180:
-                    return "red", "rojo"
-                elif 16 <= dominant_hue <= 35:
-                    return "orange", "naranja"
-                elif 36 <= dominant_hue <= 70:
-                    return "yellow", "amarillo"
-                elif 71 <= dominant_hue <= 85:
-                    return "lime", "verde"
-                elif 86 <= dominant_hue <= 100:
-                    return "green", "verde"
-                elif 101 <= dominant_hue <= 130:
-                    return "blue", "azul"
-                elif 131 <= dominant_hue <= 150:
-                    return "purple", "morado"
-                elif 151 <= dominant_hue <= 164:
-                    return "pink", "rosa"
-            
-            # Encontrar la categoría general del color exacto
-            general_color = "desconocido"
-            for group_name, color_list in self.color_groups.items():
-                if best_color in color_list:
-                    general_color = group_name
-                    break
-            
-            return best_color, general_color
-                
-        except Exception as e:
-            if self.debug_mode:
-                print(f"⚠️ Error detectando color exacto: {e}")
-            return "desconocido", "desconocido"
-
-
-
-    def get_color_name_es(self, color_en: str) -> str:
-        """Traduce el nombre del color de inglés a español"""
-        return self.color_names_es.get(color_en.lower(), color_en)
-
-
-
-    def get_color_message(self, object_type: str, exact_color: str, general_color: str) -> str:
-        """Genera el mensaje de color según el tipo de objeto"""
-        if exact_color == "desconocido" or general_color == "desconocido":
-            return ""
-        
-
-
-        exact_color_es = self.get_color_name_es(exact_color)
-        general_color_es = self.get_color_name_es(general_color)
-        
-        # Para colores metálicos especiales
-        if 'metallic' in exact_color:
-            if object_type == 'person':
-                return f"con camisa {exact_color_es}"
-            else:
-                return f"{exact_color_es}"
-        
-        # Para colores exactos diferentes del general
-        if exact_color_es != general_color_es:
-            if object_type == 'person':
-                return f"con camisa {exact_color_es} ({general_color_es})"
-            else:
-                return f"{exact_color_es} ({general_color_es})"
-        else:
-            if object_type == 'person':
-                return f"con camisa {exact_color_es}"
-            else:
-                return f"{exact_color_es}"
+    
 
 
 
@@ -638,7 +379,7 @@ class MultiObjectProcessor:
         thread.daemon = True
         thread.start()
 
-    def create_annotated_image(self, frame: np.ndarray, object_type: str, object_id: int, exact_color: str = None) -> np.ndarray:
+    def create_annotated_image(self, frame: np.ndarray, object_type: str, object_id: int) -> np.ndarray:
         """Crea una imagen con el objeto señalado en cuadro AMARILLO"""
         annotated_frame = frame.copy()
         
@@ -651,15 +392,10 @@ class MultiObjectProcessor:
             
             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 3)
             
-            # Añadir etiqueta con clase, color detectado y tiempo acumulado
+            # Añadir etiqueta con clase y tiempo acumulado
             object_name_es = self.class_names_es.get(object_type, object_type.capitalize())
             
-            # Mostrar clase y color exacto si está disponible
-            if exact_color and exact_color != "desconocido":
-                exact_color_es = self.get_color_name_es(exact_color)
-                label = f"{object_name_es} - {exact_color_es}"
-            else:
-                label = f"{object_name_es}"
+            label = f"{object_name_es}"
             
             # Añadir tiempo acumulado si el objeto está dentro del ROI
             if 'entry_time' in track:
@@ -692,21 +428,21 @@ class MultiObjectProcessor:
 
 
 
-    def get_action_message(self, object_type: str, event: str, exact_color: str = None, 
-                          general_color: str = None, time_in_roi: int = 0, total_minutes: int = 0) -> str:
+    def get_action_message(self, object_type: str, event: str, time_in_roi: int = 0, total_minutes: int = 0) -> str:
         """Genera el mensaje completo según el tipo de objeto, evento y color"""
         object_name_es = self.class_names_es.get(object_type, object_type.capitalize())
+        is_person = object_type == 'person'
         
         if event == 'entrada':
-            if object_name_es in ['Persona', 'Motocicleta']:
-                base_message = f"{object_name_es} entró en el Área"
+            if is_person:
+                base_message = "Persona Entrando al area"
             else:
-                base_message = f"{object_name_es} entró al Área"
+                base_message = "Vehiculo Entrando al area"
         elif event == 'salida':
-            if total_minutes == 1:
-                base_message = f"{object_name_es} duró {total_minutes} minuto en el Área"
+            if is_person:
+                base_message = "Persona Saliendo del area"
             else:
-                base_message = f"{object_name_es} duró {total_minutes} minutos en el Área"
+                base_message = "Vehiculo Saliendo del area"
         elif event == 'alerta_periodica':
             minutes = time_in_roi // 60
             if minutes == 1:
@@ -716,15 +452,129 @@ class MultiObjectProcessor:
         else:
             base_message = f"{object_name_es} {event.upper()}"
         
-        if exact_color and exact_color != "desconocido":
-            color_message = self.get_color_message(object_type, exact_color, general_color)
-            if color_message:
-                return f"{base_message} {color_message}"
-        
         return base_message
 
+
+    def _get_entity_type(self, object_class: str) -> str:
+        return 'person' if object_class == 'person' else 'vehicle'
+
+
+    def _direction_message(self, entity_type: str, entering: bool) -> str:
+        if entity_type == 'person':
+            return "Persona Entrando al area" if entering else "Persona Saliendo del area"
+        return "Vehiculo Entrando al area" if entering else "Vehiculo Saliendo del area"
+
+
+    def _side_of_line(self, p1: Tuple[float, float], p2: Tuple[float, float], p: Tuple[float, float]) -> float:
+        return (p2[0] - p1[0]) * (p[1] - p1[1]) - (p2[1] - p1[1]) * (p[0] - p1[0])
+
+
+    def _enqueue_alert_meta(self, alert_meta: Dict[str, Any]):
+        """Encola una alerta en metadata respetando el lock."""
+        try:
+            if getattr(self, 'pending_alerts', None) is not None:
+                with self.pending_alerts_lock:
+                    self.pending_alerts.append(alert_meta)
+        except Exception as e:
+            logger.error(f"Error encolando alerta pendiente: {e}")
+
+
+    def _process_door_crossings(self, frame: np.ndarray):
+        """Detecta cruces de puerta usando un ROI de puerta y encola alertas."""
+        if not self.door_active or self.door_polygon is None:
+            return
+
+        if self.door_direction_active and self.door_direction and len(self.door_direction) == 2:
+            self._process_door_directional()
+            return
+
+        roi_polygon_points = self.door_polygon.reshape((-1, 1, 2))
+        now = time.time()
+
+        for track_id, track in list(self.active_tracks.items()):
+            if track.get('class') not in ('person', 'car', 'truck', 'bus', 'motorcycle'):
+                continue
+
+            current_pos = track['center']
+            is_inside = self.is_inside_polygon(current_pos, roi_polygon_points)
+            prev_inside = track.get('door_inside', False)
+            track['door_inside'] = is_inside
+
+            if is_inside != prev_inside:
+                last_ts = self.door_last_alert_time.get(track_id, 0.0)
+                if now - last_ts < self.door_alert_cooldown:
+                    continue
+
+                self.door_last_alert_time[track_id] = now
+                event = 'entrada_puerta' if is_inside else 'salida_puerta'
+                entity_type = self._get_entity_type(track.get('class'))
+                message = self._direction_message(entity_type, entering=is_inside)
+
+                alert_meta = {
+                    'event': event,
+                    'object_type': entity_type,
+                    'object_id': track_id,
+                    'timestamp': datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+                    'message': message,
+                    'image_path': None,
+                    'image_base64': None
+                }
+
+                self._enqueue_alert_meta(alert_meta)
+
+
+    def _process_door_directional(self):
+        p1, p2 = self.door_direction
+        roi_polygon_points = self.door_polygon.reshape((-1, 1, 2))
+        now = time.time()
+
+        for track_id, track in list(self.active_tracks.items()):
+            if track.get('class') not in ('person', 'car', 'truck', 'bus', 'motorcycle'):
+                continue
+
+            if len(self.track_history.get(track_id, [])) < 2:
+                continue
+
+            prev_pos = self.track_history[track_id][-2]
+            current_pos = track['center']
+
+            prev_inside = self.is_inside_polygon(prev_pos, roi_polygon_points)
+            curr_inside = self.is_inside_polygon(current_pos, roi_polygon_points)
+            if not (prev_inside or curr_inside):
+                continue
+
+            prev_side = self._side_of_line(p1, p2, prev_pos)
+            curr_side = self._side_of_line(p1, p2, current_pos)
+            if prev_side == 0 or curr_side == 0 or (prev_side > 0) == (curr_side > 0):
+                continue
+
+            last_ts = self.door_last_alert_time.get(track_id, 0.0)
+            if now - last_ts < self.door_alert_cooldown:
+                continue
+
+            self.door_last_alert_time[track_id] = now
+            entering = prev_side < 0 and curr_side > 0
+
+            entity_type = self._get_entity_type(track.get('class'))
+            message = self._direction_message(entity_type, entering=entering)
+            event = 'entrada_puerta' if entering else 'salida_puerta'
+
+            print(f"🚪 Cruce puerta: {message} (id={track_id})")
+
+            alert_meta = {
+                'event': event,
+                'object_type': entity_type,
+                'object_id': track_id,
+                'timestamp': datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+                'message': message,
+                'image_path': None,
+                'image_base64': None
+            }
+
+            self._enqueue_alert_meta(alert_meta)
+
     def save_roi_photo(self, frame: np.ndarray, object_type: str, object_id: int, event: str, 
-                       exact_color: str = None, general_color: str = None, time_in_roi: int = 0, total_minutes: int = 0):
+                       time_in_roi: int = 0, total_minutes: int = 0, total_time_seconds: int = 0):
         """Guarda una foto cuando un objeto entra, sale o se genera una alerta periódica"""
         try:
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -736,7 +586,7 @@ class MultiObjectProcessor:
             filename = f"{object_name_es}_{event}_{object_id}_{timestamp}.jpg"
             filepath = os.path.join(event_dir, filename)
             
-            annotated_frame = self.create_annotated_image(frame, object_type, object_id, exact_color)
+            annotated_frame = self.create_annotated_image(frame, object_type, object_id)
             compressed_frame = self.compress_image(annotated_frame)
             
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.image_quality]
@@ -753,26 +603,53 @@ class MultiObjectProcessor:
                         imagen_base64 = base64.b64encode(buffer).decode('utf-8')
                         base64_size_kb = len(imagen_base64) / 1024
                 
-                message = self.get_action_message(object_type, event, exact_color, general_color, time_in_roi, total_minutes)
-                self.send_jarvis_wrapper(imagen_base64, message, object_id)
+                message = self.get_action_message(object_type, event, time_in_roi, total_minutes)
+
+                # Construir metadata de alerta que el cliente debe recibir junto al frame
+                # Si se pasó total_time_seconds, derivar total_minutes si no se proporcionó
+                if total_minutes == 0 and total_time_seconds:
+                    total_minutes = total_time_seconds // 60
+
+                alert_meta = {
+                    'event': event,  # 'entrada' | 'salida' | 'alerta_periodica'
+                    'object_type': object_type,
+                    'object_id': object_id,
+                    'exact_color': None,
+                    'general_color': None,
+                    'time_in_roi': time_in_roi,
+                    'total_minutes': total_minutes,
+                    'total_time_seconds': total_time_seconds,
+                    'timestamp': timestamp,
+                    'message': message,
+                    'image_path': filepath,
+                    'image_base64': imagen_base64 if base64_size_kb <= 500 else None
+                }
+
+                # Guardar metadata en cola para que el servidor la incluya en el frame/metadata enviado al cliente
+                try:
+                    if getattr(self, 'pending_alerts', None) is not None:
+                        try:
+                            with self.pending_alerts_lock:
+                                self.pending_alerts.append(alert_meta)
+                        except Exception:
+                            # Fallback por si algo falla con el lock
+                            self.pending_alerts.append(alert_meta)
+                except Exception as e:
+                    logger.error(f"Error encolando alerta pendiente: {e}")
+
+                # Solo enviar por red si no estamos emitiendo vía metadata
+                if not getattr(self, 'emit_alerts_via_metadata', False):
+                    self.send_jarvis_wrapper(imagen_base64, message, object_id)
                 
                 with open(filepath, 'wb') as f:
                     f.write(buffer)
                 
                 logger.info(f"✅ Foto de {event} guardada: {filename} ({base64_size_kb:.2f} KB)")
                 if self.debug_mode:
-                    if exact_color and exact_color != "desconocido":
-                        exact_color_es = self.get_color_name_es(exact_color)
-                        general_color_es = self.get_color_name_es(general_color) if general_color else ""
-                        color_info = f" - Color exacto: {exact_color_es}"
-                        if general_color_es and general_color_es != exact_color_es:
-                            color_info += f" ({general_color_es})"
-                        
-                        minutes = time_in_roi // 60
-                        seconds = time_in_roi % 60
-                        time_info = f" - Tiempo: {minutes}m {seconds}s" if time_in_roi > 0 else ""
-                        
-                        print(f"📸 Foto {event} guardada: {message}{color_info}{time_info} ({base64_size_kb:.2f} KB)")
+                    minutes = time_in_roi // 60
+                    seconds = time_in_roi % 60
+                    time_info = f" - Tiempo: {minutes}m {seconds}s" if time_in_roi > 0 else ""
+                    print(f"📸 Foto {event} guardada: {message}{time_info} ({base64_size_kb:.2f} KB)")
                 
                 return True
             return False
@@ -783,7 +660,7 @@ class MultiObjectProcessor:
 
 
     def check_periodic_alerts(self, frame: np.ndarray):
-        """Verifica y envía alertas periódicas a los 1, 3, 6, 9... minutos"""
+        """Verifica y envía alertas periódicas cada 5 minutos"""
         current_time = time.time()
         roi_polygon_points = self.roi_polygon.reshape((-1, 1, 2))
         
@@ -800,32 +677,24 @@ class MultiObjectProcessor:
                 time_in_roi = int(current_time - track['entry_time'])
                 current_minute = time_in_roi // 60
                 
-                # Definir los minutos en los que se debe enviar alerta: 1, 3, 6, 9, 12, 15...
+                # Definir los minutos en los que se debe enviar alerta: 5, 10, 15, 20...
                 target_minutes = []
-                minute = 1
+                minute = 5
                 while minute <= current_minute:
                     target_minutes.append(minute)
-                    minute += 3  # Después de 1, sumar 3 cada vez
+                    minute += 5
                 
                 # Verificar si hay minutos objetivo que aún no se han enviado
                 sent_minutes = self.alert_minutes_sent.get(track_id, [])
                 
                 for target_minute in target_minutes:
                     if target_minute not in sent_minutes:
-                        # Detectar color exacto si no está ya detectado
-                        if 'exact_color' not in track or track['exact_color'] == "desconocido":
-                            exact_color, general_color = self.detect_exact_color(frame, track['box'], track['class'])
-                            track['exact_color'] = exact_color
-                            track['general_color'] = general_color
-                        
                         # Enviar alerta periódica
                         success = self.save_roi_photo(
                             frame,
                             track['class'],
                             track_id,
                             'alerta_periodica',
-                            track.get('exact_color'),
-                            track.get('general_color'),
                             time_in_roi,
                             target_minute
                         )
@@ -841,17 +710,11 @@ class MultiObjectProcessor:
                             track['last_alert_minute'] = target_minute
                             
                             # Log del evento
-                            self._log_periodic_alert(track_id, track['class'], time_in_roi, target_minute,
-                                                   track.get('exact_color'), track.get('general_color'))
+                            self._log_periodic_alert(track_id, track['class'], time_in_roi, target_minute)
                             
                             if self.debug_mode:
                                 obj_name = self.class_names_es.get(track['class'], track['class'])
-                                exact_color_es = self.get_color_name_es(track.get('exact_color', 'desconocido'))
-                                general_color_es = self.get_color_name_es(track.get('general_color', 'desconocido'))
-                                color_info = f" ({exact_color_es})"
-                                if general_color_es != exact_color_es:
-                                    color_info += f" [{general_color_es}]"
-                                print(f"⏱️  ALERTA PERIÓDICA: {obj_name}{color_info} tiene {target_minute} minuto{'s' if target_minute > 1 else ''} en el Área")
+                                print(f"⏱️  ALERTA PERIÓDICA: {obj_name} tiene {target_minute} minuto{'s' if target_minute > 1 else ''} en el Área")
             else:
                 # Si no está dentro, resetear tiempos
                 if 'entry_time' in track:
@@ -864,17 +727,14 @@ class MultiObjectProcessor:
 
 
 
-    def _log_periodic_alert(self, track_id: int, obj_type: str, time_in_roi: int, minute: int,
-                           exact_color: str = None, general_color: str = None):
+    def _log_periodic_alert(self, track_id: int, obj_type: str, time_in_roi: int, minute: int):
         """Registra alerta periódica en el log"""
         ts = datetime.datetime.now().strftime("%Y-%m-d %H:%M:%S")
         obj_name_es = self.class_names_es.get(obj_type, obj_type.capitalize())
-        exact_color_es = self.get_color_name_es(exact_color) if exact_color and exact_color != "desconocido" else "desconocido"
-        general_color_es = self.get_color_name_es(general_color) if general_color and general_color != "desconocido" else "desconocido"
         minutes = time_in_roi // 60
         seconds = time_in_roi % 60
-        
-        log_entry = f"{ts},{self.frame_counter},{self.vehiculos_en_area},{self.car_count},{self.truck_count},{self.motorcycle_count},{self.person_count_inside},{self.personas_en_area},ALERTA_{minute}min_{obj_name_es},{exact_color_es},{general_color_es}"
+
+        log_entry = f"{ts},{self.frame_counter},{self.vehiculos_en_area},{self.car_count},{self.truck_count},{self.motorcycle_count},{self.person_count_inside},{self.personas_en_area},ALERTA_{minute}min_{obj_name_es}"
         log_entry += f",{minutes}:{seconds}"
         
         with open(self.log_file, 'a', encoding="utf-8") as f:
@@ -991,36 +851,41 @@ class MultiObjectProcessor:
                     if track_id in self.alert_minutes_sent:
                         del self.alert_minutes_sent[track_id]
                     
-                    # Detectar color exacto al entrar
-                    if 'exact_color' not in track or track['exact_color'] == "desconocido":
-                        exact_color, general_color = self.detect_exact_color(frame, track['box'], 'person')
-                        track['exact_color'] = exact_color
-                        track['general_color'] = general_color
-                        if self.debug_mode and exact_color != "desconocido":
-                            exact_color_es = self.get_color_name_es(exact_color)
-                            general_color_es = self.get_color_name_es(general_color) if general_color else ""
-                            color_info = f" ({exact_color_es})"
-                            if general_color_es and general_color_es != exact_color_es:
-                                color_info += f" [{general_color_es}]"
-                            print(f"🌈 Persona detectada: color exacto{color_info}")
-                    
-                    if hasattr(self, 'last_processed_frame'):
-                        self.save_roi_photo(
-                            self.last_processed_frame, 
-                            'person', 
-                            track_id, 
-                            'entrada',
-                            track.get('exact_color'),
-                            track.get('general_color')
-                        )
+                    frame_src = self.last_processed_frame if hasattr(self, 'last_processed_frame') else frame
+                    try:
+                        with self.pending_alerts_lock:
+                            prev_len = len(self.pending_alerts)
+                    except Exception:
+                        prev_len = None
+
+                    success = self.save_roi_photo(
+                        frame_src,
+                        'person',
+                        track_id,
+                        'entrada'
+                    )
+
+                    try:
+                        with self.pending_alerts_lock:
+                            new_len = len(self.pending_alerts)
+                    except Exception:
+                        new_len = None
+
+                    if not success or (prev_len is not None and new_len is not None and new_len == prev_len):
+                        message = self.get_action_message('person', 'entrada')
+                        alert_meta = {
+                            'event': 'entrada',
+                            'object_type': 'person',
+                            'object_id': track_id,
+                            'timestamp': datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+                            'message': message,
+                            'image_path': None,
+                            'image_base64': None
+                        }
+                        self._enqueue_alert_meta(alert_meta)
                     
                     if self.debug_mode:
-                        exact_color_es = self.get_color_name_es(track.get('exact_color', 'desconocido'))
-                        general_color_es = self.get_color_name_es(track.get('general_color', 'desconocido'))
-                        color_info = f" ({exact_color_es})"
-                        if general_color_es != exact_color_es:
-                            color_info += f" [{general_color_es}]"
-                        print(f"👤 Persona{color_info} entró en el Área")
+                        print(f"👤 Persona entró en el Área")
                 
                 elif not is_inside and previous_inside:
                     # Calcular tiempo total en el área
@@ -1037,25 +902,43 @@ class MultiObjectProcessor:
                     if track_id in self.alert_minutes_sent:
                         del self.alert_minutes_sent[track_id]
                     
-                    if hasattr(self, 'last_processed_frame'):
-                        self.save_roi_photo(
-                            self.last_processed_frame, 
-                            'person', 
-                            track_id, 
-                            'salida',
-                            track.get('exact_color'),
-                            track.get('general_color'),
-                            total_time_seconds=0,
-                            total_minutes=total_minutes
-                        )
+                    frame_src = self.last_processed_frame if hasattr(self, 'last_processed_frame') else frame
+                    try:
+                        with self.pending_alerts_lock:
+                            prev_len = len(self.pending_alerts)
+                    except Exception:
+                        prev_len = None
+
+                    success = self.save_roi_photo(
+                        frame_src,
+                        'person',
+                        track_id,
+                        'salida',
+                        total_time_seconds=total_time,
+                        total_minutes=total_minutes
+                    )
+
+                    try:
+                        with self.pending_alerts_lock:
+                            new_len = len(self.pending_alerts)
+                    except Exception:
+                        new_len = None
+
+                    if not success or (prev_len is not None and new_len is not None and new_len == prev_len):
+                        message = self.get_action_message('person', 'salida', total_minutes=total_minutes)
+                        alert_meta = {
+                            'event': 'salida',
+                            'object_type': 'person',
+                            'object_id': track_id,
+                            'timestamp': datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+                            'message': message,
+                            'image_path': None,
+                            'image_base64': None
+                        }
+                        self._enqueue_alert_meta(alert_meta)
                     
                     if self.debug_mode:
-                        exact_color_es = self.get_color_name_es(track.get('exact_color', 'desconocido'))
-                        general_color_es = self.get_color_name_es(track.get('general_color', 'desconocido'))
-                        color_info = f" ({exact_color_es})"
-                        if general_color_es != exact_color_es:
-                            color_info += f" [{general_color_es}]"
-                        print(f"👤 Persona{color_info} salió del Área - Duró {total_minutes} minutos")
+                        print(f"👤 Persona salió del Área - Duró {total_minutes} minutos")
                 
                 if is_inside:
                     track['has_been_inside'] = True
@@ -1096,36 +979,16 @@ class MultiObjectProcessor:
                 if track_id in self.alert_minutes_sent:
                     del self.alert_minutes_sent[track_id]
                 
-                # Detectar color exacto al entrar
-                if 'exact_color' not in track or track['exact_color'] == "desconocido":
-                    exact_color, general_color = self.detect_exact_color(frame, track['box'], track['class'])
-                    track['exact_color'] = exact_color
-                    track['general_color'] = general_color
-                    if self.debug_mode and exact_color != "desconocido":
-                        exact_color_es = self.get_color_name_es(exact_color)
-                        general_color_es = self.get_color_name_es(general_color) if general_color else ""
-                        color_info = f" ({exact_color_es})"
-                        if general_color_es and general_color_es != exact_color_es:
-                            color_info += f" [{general_color_es}]"
-                        print(f"🌈 {self.class_names_es.get(track['class'])} detectado: color exacto{color_info}")
-                
-                if hasattr(self, 'last_processed_frame'):
-                    self.save_roi_photo(
-                        self.last_processed_frame, 
-                        track['class'], 
-                        track_id, 
-                        'entrada',
-                        track.get('exact_color'),
-                        track.get('general_color')
-                    )
+                frame_src = self.last_processed_frame if hasattr(self, 'last_processed_frame') else frame
+                self.save_roi_photo(
+                    frame_src,
+                    track['class'],
+                    track_id,
+                    'entrada'
+                )
                 
                 if self.debug_mode:
-                    exact_color_es = self.get_color_name_es(track.get('exact_color', 'desconocido'))
-                    general_color_es = self.get_color_name_es(track.get('general_color', 'desconocido'))
-                    color_info = f" ({exact_color_es})"
-                    if general_color_es != exact_color_es:
-                        color_info += f" [{general_color_es}]"
-                    print(f"🚪 {self.class_names_es.get(track['class'])}{color_info} entró al Área")
+                    print(f"🚪 {self.class_names_es.get(track['class'])} entró al Área")
             
             elif not is_inside and previous_inside:
                 # Calcular tiempo total en el área
@@ -1142,25 +1005,18 @@ class MultiObjectProcessor:
                 if track_id in self.alert_minutes_sent:
                     del self.alert_minutes_sent[track_id]
                 
-                if hasattr(self, 'last_processed_frame'):
-                    self.save_roi_photo(
-                        self.last_processed_frame, 
-                        track['class'], 
-                        track_id, 
-                        'salida',
-                        track.get('exact_color'),
-                        track.get('general_color'),
-                        total_time_seconds=0,
-                        total_minutes=total_minutes
-                    )
+                frame_src = self.last_processed_frame if hasattr(self, 'last_processed_frame') else frame
+                self.save_roi_photo(
+                    frame_src,
+                    track['class'],
+                    track_id,
+                    'salida',
+                    total_time_seconds=total_time,
+                    total_minutes=total_minutes
+                )
                 
                 if self.debug_mode:
-                    exact_color_es = self.get_color_name_es(track.get('exact_color', 'desconocido'))
-                    general_color_es = self.get_color_name_es(track.get('general_color', 'desconocido'))
-                    color_info = f" ({exact_color_es})"
-                    if general_color_es != exact_color_es:
-                        color_info += f" [{general_color_es}]"
-                    print(f"🚪 {self.class_names_es.get(track['class'])}{color_info} salió del Área - Duró {total_minutes} minutos")
+                    print(f"🚪 {self.class_names_es.get(track['class'])} salió del Área - Duró {total_minutes} minutos")
             
             if is_inside:
                 track['has_been_inside'] = True
@@ -1246,15 +1102,8 @@ class MultiObjectProcessor:
         else:
             type_text = "VEHÍCULO"
         
-        exact_color_es = self.get_color_name_es(track.get('exact_color', 'desconocido'))
-        general_color_es = self.get_color_name_es(track.get('general_color', 'desconocido'))
-        
-        color_info = f" ({exact_color_es})"
-        if general_color_es != exact_color_es:
-            color_info += f" [{general_color_es}]"
-        
         print(f"\n{'='*60}")
-        print(f"🎉 {type_text}{color_info} EN AREA!")
+        print(f"🎉 {type_text} EN AREA!")
         print(f"   Total vehículos en área: {self.vehiculos_en_area} (C:{self.car_count}, T:{self.truck_count}, M:{self.motorcycle_count})")
         print(f"{'='*60}\n")
         
@@ -1288,15 +1137,8 @@ class MultiObjectProcessor:
         self.last_counted_frame = self.frame_counter
         self.last_counted_id = track_id
         
-        exact_color_es = self.get_color_name_es(track.get('exact_color', 'desconocido'))
-        general_color_es = self.get_color_name_es(track.get('general_color', 'desconocido'))
-        
-        color_info = f" ({exact_color_es})"
-        if general_color_es != exact_color_es:
-            color_info += f" [{general_color_es}]"
-        
         print(f"\n{'='*60}")
-        print(f"🎉 PERSONA{color_info} EN AREA!")
+        print(f"🎉 PERSONA EN AREA!")
         print(f"   Total personas en área: {self.personas_en_area}")
         print(f"{'='*60}\n")
         
@@ -1452,9 +1294,7 @@ class MultiObjectProcessor:
             'total_frames_in_roi': 0,
             'frames_out_roi': 0 if is_inside else 1,
             'entry_frame': self.frame_counter if is_inside else None,
-            'frames_without_detection': 0,
-            'exact_color': "desconocido",
-            'general_color': "desconocido"
+            'frames_without_detection': 0
         }
         
         if is_inside:
@@ -1471,6 +1311,48 @@ class MultiObjectProcessor:
         if self.debug_mode and is_inside:
             obj_name = self.class_names_es.get(detection['class'], detection['class'])
             print(f"🆕 {obj_name} detectado dentro del ROI")
+
+
+    def get_camera_processor(self, camera_id: int):
+        """Retorna un procesador aislado por cámara para evitar mezcla de estados."""
+        try:
+            cam_key = str(camera_id)
+        except Exception:
+            cam_key = camera_id
+
+        if cam_key in self._camera_processors:
+            return self._camera_processors[cam_key]
+
+        proc = MultiObjectProcessor(
+            client_id=f"{self.client_id}_{cam_key}" if self.client_id is not None else None,
+            model_path=self.model_path,
+            confidence_threshold=self.confidence_threshold,
+            vehicle_confidence_threshold=self.vehicle_confidence_threshold,
+            person_confidence_threshold=self.person_confidence_threshold,
+            iou_threshold=self.iou_threshold,
+            device=self.device,
+            share_model=self.share_model,
+            log_file=self.log_file,
+            car_exit_dir=self.car_exit_dir,
+            image_quality=self.image_quality,
+            min_time_in_roi=self.min_time_in_roi,
+            max_frames_out=self.max_frames_out,
+            min_track_frames=self.min_track_frames,
+            show_minimal_info=self.show_minimal_info,
+            exit_frames_threshold=self.exit_frames_threshold,
+            max_frames_without_detection=self.max_frames_without_detection,
+            max_image_size=self.max_image_size
+        )
+        proc.debug_mode = self.debug_mode
+        proc.emit_alerts_via_metadata = getattr(self, 'emit_alerts_via_metadata', True)
+        proc.max_alerts_per_frame = getattr(self, 'max_alerts_per_frame', 1)
+        try:
+            proc.roi_polygon = self.roi_polygon.copy()
+        except Exception:
+            pass
+
+        self._camera_processors[cam_key] = proc
+        return proc
 
     def draw_detections(self, image: np.ndarray, vehicles_inside: int) -> np.ndarray:
         """Dibuja información en el frame con recuadros AMARILLOS y tiempo acumulado"""
@@ -1489,6 +1371,13 @@ class MultiObjectProcessor:
         for x, y in self.roi_polygon:
             cv2.circle(image, (x, y), 8, (255, 0, 0), -1)
             cv2.circle(image, (x, y), 8, (255, 255, 255), 2)
+
+        if self.door_active and self.door_polygon is not None:
+            cv2.polylines(image, [self.door_polygon], isClosed=True, color=(0, 165, 255), thickness=3)
+
+        if self.door_direction_active and self.door_direction and len(self.door_direction) == 2:
+            p1, p2 = self.door_direction
+            cv2.arrowedLine(image, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), (0, 165, 255), 3, tipLength=0.2)
         
         # Dibujar tracks con recuadros AMARILLOS
         for tid, obj in list(self.active_tracks.items()):
@@ -1506,16 +1395,8 @@ class MultiObjectProcessor:
             thickness = 2
             cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
             
-            # Obtener el color detectado (si existe)
-            exact_color = obj.get('exact_color', 'desconocido')
-            general_color = obj.get('general_color', 'desconocido')
-            
-            # Construir el texto: clase, color detectado y tiempo acumulado
-            if exact_color != "desconocido":
-                exact_color_es = self.get_color_name_es(exact_color)
-                text = f"{class_name_es} - {exact_color_es}"
-            else:
-                text = f"{class_name_es}"
+            # Construir el texto: clase y tiempo acumulado
+            text = f"{class_name_es}"
             
             # Añadir tiempo acumulado si el objeto está dentro del ROI
             if 'entry_time' in obj:
@@ -1561,7 +1442,7 @@ class MultiObjectProcessor:
     
     
 
-    def process_frame(self, image: np.ndarray, roi=None, activate_roi=False) -> Tuple[np.ndarray, Dict[str, Any]]:
+    def process_frame(self, image: np.ndarray, roi=None, activate_roi=False, door_roi=None, door_activate=False, door_direction=None, door_direction_activate=False) -> Tuple[np.ndarray, Dict[str, Any]]:
         if self.model is None:
             raise RuntimeError("Modelo YOLO no inicializado")
         
@@ -1569,6 +1450,18 @@ class MultiObjectProcessor:
             self.roi_polygon = np.array(roi, np.int32)
             if self.debug_mode:
                 print(f"📍 ROI actualizado: {len(roi)} puntos")
+
+        if door_roi is not None:
+            self.door_polygon = np.array(door_roi, np.int32)
+            self.door_active = bool(door_activate)
+
+        self.door_direction_active = bool(door_direction_activate)
+        if door_direction is not None:
+            try:
+                p1, p2 = door_direction
+                self.door_direction = (tuple(p1), tuple(p2))
+            except Exception:
+                self.door_direction = None
 
         self.frame_counter += 1
         self.last_processed_frame = image.copy()
@@ -1585,17 +1478,30 @@ class MultiObjectProcessor:
                 inference_image = image
 
             # Detección con YOLO (usando inference_image)
+            door_class_ids = self._get_door_class_ids() if door_activate else []
+            yolo_classes = list(self.all_classes)
+            for cid in door_class_ids:
+                if cid not in yolo_classes:
+                    yolo_classes.append(cid)
+
+            effective_min_conf = min(
+                self.confidence_threshold,
+                self.vehicle_confidence_threshold,
+                self.person_confidence_threshold
+            )
+
             results = self.model.predict(
                 inference_image,
                 imgsz=640,
-                conf=self.confidence_threshold,
+                conf=effective_min_conf,
                 iou=self.iou_threshold,
-                classes=self.all_classes,
+                classes=yolo_classes,
                 verbose=False,
                 max_det=50
             )
             
             detections = []
+            door_detections = []
             vehicles_detected = 0
             persons_detected = 0
             
@@ -1607,19 +1513,40 @@ class MultiObjectProcessor:
                 
                 for i in range(boxes.shape[0]):
                     cid = int(cls[i])
+                    conf = confs[i] if i < len(confs) else 0.5
+                    if door_class_ids and cid in door_class_ids:
+                        if conf < self.confidence_threshold:
+                            continue
+                        door_detections.append({
+                            'class': 'door',
+                            'box': boxes[i],
+                            'center': self.center_of(boxes[i]),
+                            'confidence': conf
+                        })
+                        continue
                     if cid == 0:
+                        if conf < self.person_confidence_threshold:
+                            continue
                         cname = 'person'
                         persons_detected += 1
                     elif cid == 2:
+                        if conf < self.vehicle_confidence_threshold:
+                            continue
                         cname = 'car'
                         vehicles_detected += 1
                     elif cid == 3:
+                        if conf < self.vehicle_confidence_threshold:
+                            continue
                         cname = 'motorcycle'
                         vehicles_detected += 1
                     elif cid == 5:
+                        if conf < self.vehicle_confidence_threshold:
+                            continue
                         cname = 'bus'
                         vehicles_detected += 1
                     elif cid == 7:
+                        if conf < self.vehicle_confidence_threshold:
+                            continue
                         cname = 'truck'
                         vehicles_detected += 1
                     else:
@@ -1632,8 +1559,11 @@ class MultiObjectProcessor:
                         'class': cname,
                         'box': boxg,
                         'center': center,
-                        'confidence': confs[i] if i < len(confs) else 0.5
+                        'confidence': conf
                     })
+
+            if door_activate and door_roi is None:
+                self._update_door_from_detections(door_detections)
             
             if self.debug_mode and detections:
                 print(f"📊 Frame {self.frame_counter}: {len(detections)} detecciones ({vehicles_detected} vehículos, {persons_detected} personas)")
@@ -1646,6 +1576,9 @@ class MultiObjectProcessor:
             
             # Verificar y enviar alertas periódicas
             self.check_periodic_alerts(image)
+
+            # Verificar cruces de puerta (entrada/salida de personal)
+            self._process_door_crossings(image)
             
             # Log periódico
             if self.frame_counter % 30 == 0:
@@ -1666,6 +1599,7 @@ class MultiObjectProcessor:
             metadata = {
                 'frame_number': self.frame_counter,
                 'roi_active': activate_roi,
+                'door_active': self.door_active,
                 'vehicles_detected': vehicles_detected,
                 'persons_detected': persons_detected,
                 'vehicles_in_area': self.vehiculos_en_area,
@@ -1680,13 +1614,28 @@ class MultiObjectProcessor:
                 'last_counted_frame': self.last_counted_frame
             }
             
+            # Extraer alertas pendientes y adjuntarlas al metadata (se vacía la cola)
+            alerts = []
+            try:
+                if getattr(self, 'pending_alerts', None) is not None:
+                    with self.pending_alerts_lock:
+                        max_alerts = int(getattr(self, 'max_alerts_per_frame', 1) or 1)
+                        for _ in range(max_alerts):
+                            if not self.pending_alerts:
+                                break
+                            alerts.append(self.pending_alerts.popleft())
+            except Exception as e:
+                logger.error(f"Error extrayendo alertas pendientes: {e}")
+
+            metadata['alerts'] = alerts
+
             return processed_image, metadata
             
         except Exception as e:
             logger.error(f"Error en procesamiento de frame: {e}")
             import traceback
             traceback.print_exc()
-            return image, {'error': str(e)}
+            return image, {'error': str(e), 'alerts': []}
 
 
 

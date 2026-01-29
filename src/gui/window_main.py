@@ -2,6 +2,13 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMainWindow, QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QLabel
 from ..analityc.core.hardware_available import device_hardware
 
+
+def _get_device_default() -> str:
+    dev = getattr(device_hardware, 'device_default', 'cpu')
+    if isinstance(dev, dict):
+        return dev.get('gpu_use', 'cpu')
+    return dev if isinstance(dev, str) else 'cpu'
+
 class Main_Window(QMainWindow):
     
     def __init__(self):
@@ -54,7 +61,7 @@ class Main_Window(QMainWindow):
             no_gpu_label = QLabel('No GPUs available (Not detected)')
             main_layout.addWidget(no_gpu_label)
             
-        device_default = QLabel(f"Default Device: {device_hardware.device_default['gpu_use'] if device_hardware.cuda_available else 'cpu'}")
+        device_default = QLabel(f"Default Device: {_get_device_default() if device_hardware.cuda_available else 'cpu'}")
         main_layout.addWidget(device_default)
 
         # Sección de botones
