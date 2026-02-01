@@ -54,7 +54,7 @@ class Train:
             name=self.project_name_roboflow,
             exist_ok = True,
             workers = 8,
-            imgsz=500,         # Reducido a 320
+            imgsz=512,
             pretrained = True,
             amp = True,  # Mixed precision
             cache = False,  # Desactivar si problemas de memoria

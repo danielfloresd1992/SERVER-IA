@@ -461,7 +461,7 @@ class MultiObjectProcessor:
 
     def _direction_message(self, entity_type: str, entering: bool) -> str:
         if entity_type == 'person':
-            return "Persona Entrando al area" if entering else "Persona Saliendo del area"
+            return "Persona Cruzado puerta"
         return "Vehiculo Entrando al area" if entering else "Vehiculo Saliendo del area"
 
 
@@ -475,6 +475,8 @@ class MultiObjectProcessor:
             if getattr(self, 'pending_alerts', None) is not None:
                 with self.pending_alerts_lock:
                     self.pending_alerts.append(alert_meta)
+            if hasattr(self, '_frame_alerts') and isinstance(self._frame_alerts, list):
+                self._frame_alerts.append(alert_meta)
         except Exception as e:
             logger.error(f"Error encolando alerta pendiente: {e}")
 
@@ -663,6 +665,24 @@ class MultiObjectProcessor:
         """Verifica y envía alertas periódicas cada 5 minutos"""
         current_time = time.time()
         roi_polygon_points = self.roi_polygon.reshape((-1, 1, 2))
+        door_polygon_points = None
+        if self.door_active and self.door_polygon is not None:
+            door_polygon_points = self.door_polygon.reshape((-1, 1, 2))
+        door_polygon_points = None
+        if self.door_active and self.door_polygon is not None:
+            door_polygon_points = self.door_polygon.reshape((-1, 1, 2))
+        door_polygon_points = None
+        if self.door_active and self.door_polygon is not None:
+            door_polygon_points = self.door_polygon.reshape((-1, 1, 2))
+        door_polygon_points = None
+        if self.door_active and self.door_polygon is not None:
+            door_polygon_points = self.door_polygon.reshape((-1, 1, 2))
+        door_polygon_points = None
+        if self.door_active and self.door_polygon is not None:
+            door_polygon_points = self.door_polygon.reshape((-1, 1, 2))
+        door_polygon_points = None
+        if self.door_active and self.door_polygon is not None:
+            door_polygon_points = self.door_polygon.reshape((-1, 1, 2))
         
         for track_id, track in list(self.active_tracks.items()):
             current_pos = track['center']
@@ -844,7 +864,7 @@ class MultiObjectProcessor:
                 previous_inside = track.get('is_inside', False)
                 track['is_inside'] = is_inside
                 
-                if is_inside and not previous_inside:
+                if is_inside and (not previous_inside or track.get('just_created', False)):
                     # Reiniciar flags de alertas cuando entra
                     track['entry_time'] = time.time()
                     track['last_alert_minute'] = 0
@@ -858,12 +878,14 @@ class MultiObjectProcessor:
                     except Exception:
                         prev_len = None
 
-                    success = self.save_roi_photo(
-                        frame_src,
-                        'person',
-                        track_id,
-                        'entrada'
-                    )
+                    success = False
+                    if frame_src is not None:
+                        success = self.save_roi_photo(
+                            frame_src,
+                            'person',
+                            track_id,
+                            'entrada'
+                        )
 
                     try:
                         with self.pending_alerts_lock:
@@ -871,7 +893,7 @@ class MultiObjectProcessor:
                     except Exception:
                         new_len = None
 
-                    if not success or (prev_len is not None and new_len is not None and new_len == prev_len):
+                    if frame_src is not None and (not success or (prev_len is not None and new_len is not None and new_len == prev_len)):
                         message = self.get_action_message('person', 'entrada')
                         alert_meta = {
                             'event': 'entrada',
@@ -883,7 +905,9 @@ class MultiObjectProcessor:
                             'image_base64': None
                         }
                         self._enqueue_alert_meta(alert_meta)
-                    
+
+                    track['just_created'] = False
+
                     if self.debug_mode:
                         print(f"👤 Persona entró en el Área")
                 
@@ -909,14 +933,16 @@ class MultiObjectProcessor:
                     except Exception:
                         prev_len = None
 
-                    success = self.save_roi_photo(
-                        frame_src,
-                        'person',
-                        track_id,
-                        'salida',
-                        total_time_seconds=total_time,
-                        total_minutes=total_minutes
-                    )
+                    success = False
+                    if frame_src is not None:
+                        success = self.save_roi_photo(
+                            frame_src,
+                            'person',
+                            track_id,
+                            'salida',
+                            total_time_seconds=total_time,
+                            total_minutes=total_minutes
+                        )
 
                     try:
                         with self.pending_alerts_lock:
@@ -924,7 +950,7 @@ class MultiObjectProcessor:
                     except Exception:
                         new_len = None
 
-                    if not success or (prev_len is not None and new_len is not None and new_len == prev_len):
+                    if frame_src is not None and (not success or (prev_len is not None and new_len is not None and new_len == prev_len)):
                         message = self.get_action_message('person', 'salida', total_minutes=total_minutes)
                         alert_meta = {
                             'event': 'salida',
@@ -936,7 +962,7 @@ class MultiObjectProcessor:
                             'image_base64': None
                         }
                         self._enqueue_alert_meta(alert_meta)
-                    
+
                     if self.debug_mode:
                         print(f"👤 Persona salió del Área - Duró {total_minutes} minutos")
                 
@@ -966,13 +992,14 @@ class MultiObjectProcessor:
                     elif not track.get('has_been_inside', False) and track['frames_out_roi'] > self.max_frames_out:
                         tracks_to_remove.append(track_id)
                 
+                track['just_created'] = False
                 continue
             
             # Procesar VEHÍCULOS
             previous_inside = track.get('is_inside', False)
             track['is_inside'] = is_inside
             
-            if is_inside and not previous_inside:
+            if is_inside and (not previous_inside or track.get('just_created', False)):
                 # Reiniciar flags de alertas cuando entra
                 track['entry_time'] = time.time()
                 track['last_alert_minute'] = 0
@@ -987,6 +1014,8 @@ class MultiObjectProcessor:
                     'entrada'
                 )
                 
+                track['just_created'] = False
+
                 if self.debug_mode:
                     print(f"🚪 {self.class_names_es.get(track['class'])} entró al Área")
             
@@ -1043,6 +1072,8 @@ class MultiObjectProcessor:
             
             if not track.get('has_been_inside', False) and track.get('frames_out_roi', 0) >= self.exit_frames_threshold:
                 tracks_to_remove.append(track_id)
+
+            track['just_created'] = False
         
         for track_id in tracks_to_remove:
             self._remove_track(track_id)
@@ -1224,6 +1255,8 @@ class MultiObjectProcessor:
         
         return matched_pairs, unmatched_detections, unmatched_track_ids
 
+
+
     def update_tracks(self, detections: list):
         """Actualiza tracks con nuevas detecciones"""
         self.cleanup_undetected_tracks(detections)
@@ -1232,11 +1265,20 @@ class MultiObjectProcessor:
         filtered_detections = []
         roi_polygon_points = self.roi_polygon.reshape((-1, 1, 2))
         
+        door_polygon_points = None
+        if self.door_active and self.door_polygon is not None:
+            door_polygon_points = self.door_polygon.reshape((-1, 1, 2))
+        
         for det in detections:
             center = det['center']
             distance_to_roi = cv2.pointPolygonTest(roi_polygon_points, (int(center[0]), int(center[1])), True)
             
-            if distance_to_roi > -50:
+            distance_to_door = None
+            if door_polygon_points is not None:
+                distance_to_door = cv2.pointPolygonTest(door_polygon_points, (int(center[0]), int(center[1])), True)
+
+            # Incluir si está cerca del ROI principal O si está cerca del ROI de la puerta
+            if distance_to_roi > -50 or (distance_to_door is not None and distance_to_door > -50):
                 filtered_detections.append(det)
         
         current_detections = []
@@ -1273,6 +1315,9 @@ class MultiObjectProcessor:
             for det in current_detections:
                 self._create_new_track(det)
 
+
+
+
     def _create_new_track(self, detection: Dict):
         new_id = self.next_id
         self.next_id += 1
@@ -1294,7 +1339,8 @@ class MultiObjectProcessor:
             'total_frames_in_roi': 0,
             'frames_out_roi': 0 if is_inside else 1,
             'entry_frame': self.frame_counter if is_inside else None,
-            'frames_without_detection': 0
+            'frames_without_detection': 0,
+            'just_created': True
         }
         
         if is_inside:
@@ -1311,6 +1357,8 @@ class MultiObjectProcessor:
         if self.debug_mode and is_inside:
             obj_name = self.class_names_es.get(detection['class'], detection['class'])
             print(f"🆕 {obj_name} detectado dentro del ROI")
+
+
 
 
     def get_camera_processor(self, camera_id: int):
@@ -1353,6 +1401,8 @@ class MultiObjectProcessor:
 
         self._camera_processors[cam_key] = proc
         return proc
+
+
 
     def draw_detections(self, image: np.ndarray, vehicles_inside: int) -> np.ndarray:
         """Dibuja información en el frame con recuadros AMARILLOS y tiempo acumulado"""
@@ -1464,6 +1514,7 @@ class MultiObjectProcessor:
                 self.door_direction = None
 
         self.frame_counter += 1
+        self._frame_alerts = []
         self.last_processed_frame = image.copy()
         
         try:
@@ -1627,7 +1678,15 @@ class MultiObjectProcessor:
             except Exception as e:
                 logger.error(f"Error extrayendo alertas pendientes: {e}")
 
+            if not alerts and getattr(self, '_frame_alerts', None):
+                alerts = list(self._frame_alerts)
+
             metadata['alerts'] = alerts
+
+            try:
+                self._frame_alerts = []
+            except Exception:
+                pass
 
             return processed_image, metadata
             

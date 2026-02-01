@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from ..analityc.core.Perimetrales import MultiObjectProcessor
+from ..analityc.core.base_perimeter import BasePerimeter
 from ..analityc.core.car_washed import VehicleProcessor
 from ..analityc.core.perimetrales_multicam import PerimetralesMultiCam
 from ..analityc.core.botsort_wrapper import BoTSORTWrapper
@@ -73,7 +74,8 @@ async def _frame_worker():
     """Worker que procesa frames uno a la vez en orden de llegada.
 
     Cada item en la cola es una tupla:
-    (future, processor, img, roi, roi_activate, door_roi, door_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id, request, websocket, client_id)
+    (future, processor, img, roi, roi_activate, door_roi, door_activate, door_direction, door_direction_activate,
+     pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id, request, websocket, client_id)
     El worker ejecuta el procesamiento en el `executor` y completa el `future` con el
     dict de respuesta listo para enviar por WS.
     """
@@ -81,7 +83,7 @@ async def _frame_worker():
     while True:
         item = await frame_queue.get()
         try:
-            future, processor, img, roi, roi_activate, door_roi, door_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id, request, websocket, client_id = item
+            future, processor, img, roi, roi_activate, door_roi, door_activate, door_direction, door_direction_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id, request, websocket, client_id = item
         except Exception:
             frame_queue.task_done()
             continue
@@ -96,7 +98,7 @@ async def _frame_worker():
         try:
             # Procesamiento sincrónico en threadpool
             processed_img, metadata = await loop.run_in_executor(
-                executor, process_image_sync, processor, img, roi, roi_activate, door_roi, door_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id
+                executor, process_image_sync, processor, img, roi, roi_activate, door_roi, door_activate, door_direction, door_direction_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id
             )
 
             # Codificar imagen también en threadpool
@@ -110,6 +112,12 @@ async def _frame_worker():
             processed_base64 = base64.b64encode(encoded_image.tobytes()).decode('utf-8')
 
             processing_time = round(time.time() - start_time, 3)
+            try:
+                alerts_dbg = metadata.get('alerts', []) if isinstance(metadata, dict) else []
+                #print(f"🔔 alerts enviados: {len(alerts_dbg)}")
+            except Exception:
+                pass
+
             response = {
                 'camera_id': camera_id,
                 'status': 'success',
@@ -145,12 +153,14 @@ async def _frame_worker():
 
 
 def process_image_sync(processor, img, roi, activate_roi, door_roi=None, door_activate=False,
-                       pay_roi=None, withdraw_roi=None, pay_roi_activate=True, withdraw_roi_activate=True, camera_id: int = 1):
+                       door_direction=None, door_direction_activate=False, pay_roi=None, withdraw_roi=None,
+                       pay_roi_activate=True, withdraw_roi_activate=True, camera_id: int = 1):
     """Función sincrónica para procesamiento de imágenes.
 
     Soporta procesadores existentes (`process_frame(img, roi, activate_roi)`) y
     `PerimetralesMultiCam` (que expone `process_frame(frame, camera_id)`).
     """
+
     try:
         # Si es el procesador multicámara usamos su API y dibujamos resultados
         if isinstance(processor, PerimetralesMultiCam):
@@ -192,12 +202,12 @@ def process_image_sync(processor, img, roi, activate_roi, door_roi=None, door_ac
         if isinstance(processor, MultiObjectProcessor):
             try:
                 cam_proc = processor.get_camera_processor(camera_id)
-                return cam_proc.process_frame(img, roi, activate_roi, door_roi, door_activate)
+                return cam_proc.process_frame(img, roi, activate_roi, door_roi, door_activate, door_direction, door_direction_activate)
             except Exception:
-                return processor.process_frame(img, roi, activate_roi, door_roi, door_activate)
+                return processor.process_frame(img, roi, activate_roi, door_roi, door_activate, door_direction, door_direction_activate)
 
         # Procesadores legacy
-        return processor.process_frame(img, roi, activate_roi)
+        return processor.process_frame(img, roi, activate_roi, door_roi, door_activate, door_direction, door_direction_activate)
     except Exception as e:
         logger.error(f"Error en procesamiento: {e}")
         raise
@@ -227,11 +237,12 @@ async def websocket_endpoint(websocket: WebSocket, type_inference: str):
 
             )
         elif type_inference == 'Perimetrales':
-            processor = MultiObjectProcessor(
+            # client_id: str, model_path: str, device: str = 'cpu'
+            processor = BasePerimeter(
                 client_id=client_id,
-                model_path='yolo26l.pt',
-                confidence_threshold=config["confidence_threshold"],
-                iou_threshold=config["iou_threshold"],
+                model_path='yolo12l.pt',
+               # confidence_threshold=config["confidence_threshold"],
+                #iou_threshold=config["iou_threshold"],
                 device=device_hardware.gpu_tuple[0]['gpu_use']
             )
         elif type_inference == 'PerimetralesMultiCam':
@@ -265,6 +276,9 @@ async def websocket_endpoint(websocket: WebSocket, type_inference: str):
             }
         
 
+
+        print('dato enviado ☻☻☻☻')        
+
         # Enviar mensaje de bienvenida
         await websocket.send_text(json.dumps({
             'id_connection': id(websocket),
@@ -294,17 +308,38 @@ async def websocket_endpoint(websocket: WebSocket, type_inference: str):
                     raise ValueError(f"JSON parse error: {e}")
 
             data = request['data']
-
+        
             try:
                 start_time = time.time()
 
                 # --- PROCESAMIENTO ENCOLADO (cola global, procesado secuencial) ---
                 # Validar campos requeridos y asignar variables
+              
+
+
                 image_data = data['image']
+
+
+                # ROI PRINCIPAL
                 roi = data.get('roi_coordinates', '')
                 roi_activate = data['roi_activate']
+
+
+
+                # ROI DE PUERTA
                 door_roi = data.get('door_roi_coordinates', None)
                 door_activate = data.get('door_roi_activate', False)
+
+                # Dirección de puerta (línea)
+                door_direction = data.get('door_direction', None)
+                door_direction_activate = data.get('door_direction_activate', False)
+
+
+
+                # Compatibilidad: algunos clientes envían la línea en door_direction_activate
+                if isinstance(door_direction_activate, (list, tuple)) and door_direction is None:
+                    door_direction = door_direction_activate
+                    door_direction_activate = True
                 pay_roi = data.get('pay_roi', None)
                 withdraw_roi = data.get('withdraw_roi', None)
                 pay_roi_activate = data.get('pay_roi_activate', True)
@@ -368,8 +403,8 @@ async def websocket_endpoint(websocket: WebSocket, type_inference: str):
                 # aún aceptamos la nueva (reemplaza la anterior). Esto mantiene sólo la última.
 
                 # Registrar nuevo pending y encolar
-                pending_frames[client_id] = (future, processor, img, roi, roi_activate, door_roi, door_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id, request, websocket)
-                await frame_queue.put((future, processor, img, roi, roi_activate, door_roi, door_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id, request, websocket, client_id))
+                pending_frames[client_id] = (future, processor, img, roi, roi_activate, door_roi, door_activate, door_direction, door_direction_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id, request, websocket)
+                await frame_queue.put((future, processor, img, roi, roi_activate, door_roi, door_activate, door_direction, door_direction_activate, pay_roi, withdraw_roi, pay_roi_activate, withdraw_roi_activate, camera_id, request, websocket, client_id))
 
                 # Esperar resultado del worker (respuesta ya lista para enviar)
                 result = await future
