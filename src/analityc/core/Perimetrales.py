@@ -1496,7 +1496,7 @@ class MultiObjectProcessor:
         if self.model is None:
             raise RuntimeError("Modelo YOLO no inicializado")
         
-        if roi is not None: 
+        if roi is not None and isinstance(roi, (list, np.ndarray)) and len(roi) >= 3: 
             self.roi_polygon = np.array(roi, np.int32)
             if self.debug_mode:
                 print(f"📍 ROI actualizado: {len(roi)} puntos")
